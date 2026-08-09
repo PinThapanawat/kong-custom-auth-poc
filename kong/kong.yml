@@ -1,0 +1,25 @@
+_format_version: "3.0"
+
+services:
+  - name: account-service
+    url: http://account-service:8080
+
+    routes:
+      - name: account-api
+        paths:
+          - /api
+        methods:
+          - GET
+        strip_path: true
+
+    plugins:
+      - name: custom-auth
+        config:
+          auth_service_url: http://auth-service:8080/validate
+          timeout_ms: 3000
+
+      - name: correlation-id
+        config:
+          header_name: X-Correlation-ID
+          generator: uuid
+          echo_downstream: true
