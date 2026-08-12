@@ -1,0 +1,101 @@
+{
+  "realm": "poc",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 120,
+  "clientScopes": [
+    {
+      "name": "roles",
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "name": "realm roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "multivalued": "true",
+            "userinfo.token.claim": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "realm_access.roles",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-sub-mapper",
+          "consentRequired": false,
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "defaultDefaultClientScopes": ["roles"],
+  "clients": [
+    {
+      "clientId": "poc-client",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["*"],
+      "webOrigins": ["*"],
+      "defaultClientScopes": ["roles"]
+    },
+    {
+      "clientId": "poc-introspection",
+      "enabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "secret": "introspection-secret",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false
+    }
+  ],
+  "roles": {
+    "realm": [
+      { "name": "customer" },
+      { "name": "admin" },
+      { "name": "account.read" },
+      { "name": "account.write" }
+    ]
+  },
+  "users": [
+    {
+      "username": "demo-user",
+      "email": "demo-user@example.com",
+      "firstName": "Demo",
+      "lastName": "User",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "demo-pass", "temporary": false }
+      ],
+      "realmRoles": ["customer", "account.read"]
+    },
+    {
+      "username": "admin-user",
+      "email": "admin-user@example.com",
+      "firstName": "Admin",
+      "lastName": "User",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "admin-pass", "temporary": false }
+      ],
+      "realmRoles": ["admin", "account.read", "account.write"]
+    }
+  ]
+}
