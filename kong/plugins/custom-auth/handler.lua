@@ -82,21 +82,34 @@ function CustomAuthHandler:access(conf)
     return unauthorized("Invalid Authorization header")
   end
 
-  local dict = conf.enable_cache and ngx.shared[CACHE_DICT_NAME] or nil
+  -- A request body is unique per-request (unlike the token, which repeats
+  -- across many requests), so it is never cached: caching a decrypted
+  -- payload under the token's cache key would replay a stale payload onto
+  -- a later request that reuses the same token with different content.
+  local raw_body = kong.request.get_raw_body()
+  local has_payload = raw_body ~= nil and raw_body ~= ""
+
+  local dict = (conf.enable_cache and not has_payload) and ngx.shared[CACHE_DICT_NAME] or nil
   local auth = get_cached_auth(dict, token)
 
   if not auth then
     local httpc = http.new()
     httpc:set_timeout(conf.timeout_ms)
 
+    local body = {
+      token = token,
+      method = kong.request.get_method(),
+      path = kong.request.get_path(),
+      correlation_id = kong.request.get_header("X-Correlation-ID")
+    }
+
+    if has_payload then
+      body.payload = raw_body
+    end
+
     local res, err = httpc:request_uri(conf.auth_service_url, {
       method = "POST",
-      body = cjson.encode({
-        token = token,
-        method = kong.request.get_method(),
-        path = kong.request.get_path(),
-        correlation_id = kong.request.get_header("X-Correlation-ID")
-      }),
+      body = cjson.encode(body),
       headers = {
         ["Content-Type"] = "application/json",
         ["X-Auth-Caller"] = "kong"
@@ -132,13 +145,24 @@ function CustomAuthHandler:access(conf)
       })
     end
 
-    if auth.authenticated == true then
+    if auth.authenticated == true and not has_payload then
       store_cached_auth(dict, token, auth, conf.cache_ttl_seconds)
     end
   end
 
   if auth.authenticated ~= true then
     return unauthorized("Authentication failed")
+  end
+
+  if auth.payload_error == true then
+    return kong.response.exit(400, {
+      message = "Invalid encrypted payload"
+    })
+  end
+
+  if type(auth.payload_plaintext) == "string" then
+    kong.service.request.set_raw_body(auth.payload_plaintext)
+    kong.service.request.set_header("Content-Type", "application/json")
   end
 
   local user = auth.user or {}

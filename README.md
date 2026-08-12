@@ -229,6 +229,39 @@ pair of requests — the second request was served from Kong's shared-memory
 cache without calling the Auth Service. Wait past the TTL and repeat to see
 it call through again.
 
+## Test payload encryption (request)
+
+Beyond the token, `POST /api/accounts/transfer` also encrypts the request
+body — using the *same* Auth Service key already used for the token. Kong
+forwards the encrypted request body to Auth Service alongside the token;
+Auth Service decrypts both and hands Kong back plaintext, which Kong writes
+into the request before it ever reaches Account Service (see
+`docs/encryption-workflow.md` for the full sequence). The response is plain
+JSON — response encryption was tried (Account Service encrypting with Auth
+Service's key too) and pulled back out, since only Auth Service's private
+key could then decrypt it and the client couldn't read its own response
+without an extra round trip.
+
+```bash
+docker compose run --rm client-simulator demo-user transfer 250
+```
+
+This mints a token, encrypts a demo `{ to, amount }` transfer request with
+Auth Service's public key, and POSTs it to Kong. `demo-user` only has
+`account.read`, so expect a `403`; try `admin-user` (has `account.write`)
+for a `200` with a plaintext confirmation.
+
+Note: this endpoint's request encryption is intentionally excluded from
+Kong's claims cache — a POST body is unique per request, so caching a
+decrypted payload under the token's cache key would risk replaying a stale
+payload onto a later request that reuses the same token.
+
+To see a corrupted payload get rejected (`400`, not silently wrong data):
+
+```bash
+docker compose run --rm client-simulator admin-user transfer-tamper 300
+```
+
 ## Inspect Kong
 
 Kong Admin API:
@@ -272,6 +305,11 @@ This POC intentionally takes shortcuts for local runnability. For production:
    the existing request timeout.
 10. Add audit logging without logging credentials or raw tokens.
 11. Keep business authorization in the owning microservice.
+12. `/accounts/transfer`'s response is plaintext — response encryption was
+    tried using Auth Service's key and removed, since that key only lets
+    Auth Service (not the client) decrypt the result. See
+    `docs/encryption-workflow.md` for the client-supplied-key design that
+    would let responses be read end-to-end without that limitation.
 
 ## Main architectural decision
 

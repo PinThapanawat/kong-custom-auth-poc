@@ -10,6 +10,7 @@ services:
           - /api
         methods:
           - GET
+          - POST
         strip_path: true
 
     plugins:

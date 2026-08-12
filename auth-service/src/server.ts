@@ -39,6 +39,8 @@ type AuthResponse = {
     scopes: string[];
   };
   exp?: number;
+  payload_plaintext?: string;
+  payload_error?: boolean;
 };
 
 const KNOWN_ROLES = new Set(["customer", "admin"]);
@@ -134,6 +136,20 @@ app.post("/validate", async (req, res) => {
       authorization: { roles, scopes },
       exp: payload.exp
     };
+
+    // Request payload is encrypted with the same key as the token. Decrypt
+    // it here too (identity is already verified above) rather than handing
+    // any business service a key of its own.
+    const payloadJwe = req.body?.payload;
+    if (typeof payloadJwe === "string" && payloadJwe.length > 0) {
+      try {
+        const { plaintext: payloadPlaintext } = await jose.compactDecrypt(payloadJwe, jwePrivateKey);
+        result.payload_plaintext = new TextDecoder().decode(payloadPlaintext);
+      } catch (err) {
+        console.error("Payload decryption failed:", (err as Error).message);
+        result.payload_error = true;
+      }
+    }
 
     return res.status(200).json(result);
   } catch (err) {

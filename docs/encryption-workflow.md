@@ -1,7 +1,8 @@
 # Who gets to see what, and when
 
-Workflow for the (proposed, not yet implemented) payload encryption layer,
-alongside the token encryption already built in this repo.
+Target-state workflow for payload encryption, with per-service keys held in
+Vault. **What's actually implemented today is a simpler version of this** —
+see the note at the bottom.
 
 Kong never decrypts anything. Auth Service only ever sees identity.
 Account Service only ever sees its own payload. And no service — not
@@ -75,5 +76,37 @@ sequenceDiagram
 - Token JWE decryption + JWT verification: `auth-service/src/server.ts`
 - Claims caching: `kong/plugins/custom-auth/handler.lua`
 - Architecture and trade-offs for the token half of this flow: [`README.md`](../README.md)
-- Payload encryption/decryption at the business-service layer, and Vault/KMS
-  key governance, are discussed but **not yet implemented** in this repo.
+
+## What's actually implemented vs. this diagram
+
+The repo currently implements a **simplified version** of steps 1–4:
+`account-service`'s `POST /accounts/transfer` route encrypts its request and
+response, but reuses Auth Service's *existing* token key rather than a
+separate Vault-issued key — Account Service never holds any key material at
+all. Concretely, the differences from the diagram above:
+
+- **Step 7** (`AccountService→Vault: decrypt(payload)`) doesn't happen —
+  there's no Vault, and Account Service has no key. Instead, Auth Service
+  decrypts the request payload in the same `/validate` call that decrypts
+  the token (same key, one extra `try`/`catch`), and Kong rewrites the
+  upstream request body with the plaintext before it reaches Account
+  Service. Account Service receives ordinary JSON, no crypto code needed on
+  the request side.
+- **Step 9** (`encrypt(response, client's public key)`) is **not
+  implemented at all** — the response is plain JSON. It was tried using
+  Auth Service's key (same as everything else, for consistency with step 7),
+  but that has a real consequence: only Auth Service's private key can
+  decrypt something encrypted with its public key, so the client can't read
+  its own response without an extra round trip back through Auth Service to
+  decrypt it. That round trip was judged not worth it, so response
+  encryption was removed rather than kept in that shape. This diagram's
+  step 9 — encrypt with the *client's* key, not Auth Service's — is still
+  the way to do this without that limitation, if it's revisited.
+- There is no Vault container in this repo. The governance discussion this
+  diagram documents (why private keys shouldn't be loaded into every
+  business service) remains the reasoning for *not* giving Account Service
+  a key of its own — the simplified implementation satisfies that by giving
+  it no key at all, rather than by adding Vault.
+
+See the "Test payload encryption" section in [`README.md`](../README.md) for
+how to run it.
