@@ -1,4 +1,52 @@
 services:
+  vault:
+    image: hashicorp/vault:1.18
+    container_name: vault
+    cap_add: ["IPC_LOCK"]
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "root-poc-token"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    ports:
+      - "8200:8200"
+    healthcheck:
+      # "localhost" resolves to ::1 first in this image and Vault dev mode
+      # doesn't bind the IPv6 loopback — use 127.0.0.1 explicitly.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8200/v1/sys/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_DB: pds
+      POSTGRES_USER: pds
+      POSTGRES_PASSWORD: pds-poc-password
+    volumes:
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pds"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
     container_name: keycloak
@@ -37,7 +85,6 @@ services:
       KONG_ADMIN_ERROR_LOG: /dev/stderr
       KONG_ADMIN_LISTEN: "0.0.0.0:8001"
       KONG_PROXY_LISTEN: "0.0.0.0:8000"
-      KONG_NGINX_HTTP_LUA_SHARED_DICT: "custom_auth_cache 10m"
     ports:
       - "8000:8000"
       - "8001:8001"
@@ -56,14 +103,25 @@ services:
       PORT: "8080"
       KEYCLOAK_ISSUER: "http://keycloak:8080/realms/poc"
       KEYCLOAK_JWKS_URL: "http://keycloak:8080/realms/poc/protocol/openid-connect/certs"
-      KEYCLOAK_INTROSPECT_URL: "http://keycloak:8080/realms/poc/protocol/openid-connect/token/introspect"
+      KEYCLOAK_TOKEN_URL: "http://keycloak:8080/realms/poc/protocol/openid-connect/token"
       KEYCLOAK_CLIENT_ID: "poc-client"
-      KEYCLOAK_INTROSPECTION_CLIENT_ID: "poc-introspection"
-      KEYCLOAK_INTROSPECTION_CLIENT_SECRET: "introspection-secret"
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root-poc-token"
+      DATABASE_URL: "postgres://pds:pds-poc-password@postgres:5432/pds"
+      REDIS_URL: "redis://redis:6379"
+      PDS_ENV: "poc"
+      PDS_SEK_SOURCE: "db"
+      PDS_SEK_INQUIRY_URL: "http://auth-service:8080/pds/internal/sek-inquiry"
     expose:
       - "8080"
     depends_on:
       keycloak:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
@@ -90,13 +148,15 @@ services:
       context: ./client-simulator
     container_name: client-simulator
     environment:
-      KEYCLOAK_TOKEN_URL: "http://keycloak:8080/realms/poc/protocol/openid-connect/token"
-      AUTH_SERVICE_JWE_JWKS_URL: "http://auth-service:8080/.well-known/jwe-jwks.json"
-      KONG_URL: "http://localhost:8000/api/accounts"
-      KEYCLOAK_CLIENT_ID: "poc-client"
+      PDS_BASE_URL: "http://kong:8000"
+    volumes:
+      - client-simulator-data:/app/data
     depends_on:
       keycloak:
         condition: service_healthy
-      auth-service:
+      kong:
         condition: service_started
     profiles: ["tools"]
+
+volumes:
+  client-simulator-data:

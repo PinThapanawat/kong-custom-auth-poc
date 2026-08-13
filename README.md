@@ -1,153 +1,85 @@
-# Kong + Custom Authentication Service POC
+# Kong + Payload Decryptor Service POC
 
-This is a runnable local POC demonstrating a JWE pass-through authentication flow:
+This is a runnable local POC implementing the "Payload Decryptor Service"
+(PDS) spec in `requirement /Decryption-130826-131559.pdf`: every
+request/response body between a mobile client and the backend BFF APIs is
+signed (ECDSA P-256) and JWE-encrypted, with a real Keycloak instance as the
+identity provider, Vault holding the PDS's key material, and Postgres/Redis
+backing per-session encryption keys.
 
-Client -> Kong -> Custom Authentication Service -> Account Service
-
-with a real Keycloak instance as the identity provider.
+```text
+Client -> Kong -> auth-service (the PDS) [-> Keycloak | -> account-service]
+```
 
 ## Architecture
 
 ```text
-Client --JWE--> Kong --JWE--> Auth Service (stateless)
-                                  |
-                     1. Decrypt JWE (Auth Service holds the private key)
-                                  |
-                     2. Validate inner JWT signature LOCALLY
-                        using cached Keycloak JWKS (fast, no Keycloak call)
-                                  |
-                     3. Only call Keycloak introspection if you need
-                        a real-time revocation check (optional, cacheable)
-                                  |
-Kong <---------- claims (Kong caches per-token, keyed by the raw JWE)
-     |
-     | X-User-ID / X-User-Roles / X-User-Scopes / X-Auth-Authenticated
-     v
-Account Service
+Category 1 (device enrollment, session acquiring) — thin pass-through:
+
+  Device --JWE(signed envelope)--> Kong --(routed, no crypto)--> auth-service (PDS)
+                                                                       |
+                                                     verify deviceJwt, decrypt JWE,
+                                                     verify envelope signature,
+                                                     Keycloak ROPC login,
+                                                     issue sessionJwt + SEK,
+                                                     store in Postgres (primary) /
+                                                     Redis (4h cache)
+                                                                       |
+                                                                       v
+                                                              back to Device
+
+Category 2/3 (/pds/bff/*) — Kong's custom-auth plugin brokers the call:
+
+  Device --JWE(signed envelope)--> Kong (custom-auth plugin)
+                                        |
+                                        | 1. POST /pds/internal/verify -----> auth-service (PDS)
+                                        |                                     decrypt, verify sessionJwt +
+                                        |                                     SEK + envelope signature
+                                        | <---- outcome + plaintext + X-User-* headers
+                                        |
+                                        | 2. plaintext request -------------> account-service
+                                        | <---- plaintext response            (zero crypto code)
+                                        |
+                                        | 3. POST /pds/internal/encrypt-response -> auth-service (PDS)
+                                        | <---- encrypted, signed reply
+                                        v
+                                     Device
 ```
 
-Kong never decrypts the JWE — it only ever hashes the ciphertext to form a
-cache key. Only the Auth Service holds the JWE decryption private key. The
-decrypted payload is a real access token issued and signed by Keycloak;
-the Auth Service verifies its signature against a locally cached JWKS
-(`jose.createRemoteJWKSet`) instead of calling Keycloak on every request.
+Kong is a pure pass-through for Category 1 (`kong/kong.yml`'s
+`device-enrollment`, `session-acquiring`, and `pds-jwks` routes) — it never
+decrypts anything there. For Category 2/3 (`pds-bff` route), Kong's
+`custom-auth` plugin (`kong/plugins/custom-auth/handler.lua`) actively
+checks with the PDS that auth is complete, then makes the call to
+`account-service` itself and asks the PDS to encrypt the reply — Kong still
+never holds a SEK or any PDS key, it only ever sees plaintext for the single
+hop to `account-service` in between two PDS round trips. `account-service`
+only ever sees plaintext and trusted `X-User-*` headers — no crypto code on
+either side of it.
 
-Since Keycloak doesn't natively issue JWE-wrapped access tokens, a small
-`client-simulator` CLI stands in for "the client": it logs into Keycloak,
-fetches the Auth Service's published public encryption key, and wraps the
-resulting JWT into a compact JWE.
+There are three request categories in the spec:
 
-## Why this pattern, and what it costs
+- **Category 1 — Session Acquiring** (`POST /pds/session`): request is
+  `ECDH-ES+A256KW`/`A256GCM`-encrypted to the PDS's public key; the PDS logs
+  the user into Keycloak (ROPC), mints a session + a 32-byte Session
+  Encryption Key (SEK), and returns both — encrypted to the *device's*
+  public key.
+- **Category 2 — other BFF API** (`ALL /pds/bff/*`): request/response are
+  `dir`/`A256GCM`-encrypted directly with the SEK from Category 1.
+- **Category 3 — MiniApp BFF API**: same as Category 2, with the SEK sourced
+  via an HTTP inquiry call instead of Postgres/Redis (`PDS_SEK_SOURCE=http`
+  in this repo — a config flag, not a separate deployment).
 
-### Pros and cons at a glance
+Every payload (both categories) is also wrapped in a signed binary envelope
+before encryption — see `docs/encryption-workflow.md` for the byte layout,
+sequence diagrams, and full list of deviations from the spec (SQL Server
+memory-optimized table → Postgres, multipart not implemented, Vault dev
+mode, etc.).
 
-**Pros**
-
-- Claims are opaque to Kong end to end — the gateway's logs/tracing never
-  see plaintext identity data, shrinking log-handling and compliance scope.
-- No secret material on the gateway tier — Kong holds no decryption key and
-  can't be leveraged to forge or read tokens if compromised.
-- The common path is fast: JWT signature checks are local against a cached
-  JWKS (no per-request Keycloak call), and Kong's claims cache skips the
-  Auth Service round trip entirely on repeat requests.
-- Revocation freshness is a dial, not a fixed cost — real-time introspection
-  is opt-in per route, so only the requests that need it pay for it.
-- All auth logic (decryption, verification, claims mapping) lives in one
-  place — the Auth Service — instead of being duplicated across gateways.
-- Extending roles/scopes or adding routes is config-only; Kong and Account
-  Service never need to change since they only see the resulting headers.
-
-**Cons**
-
-- Slower on a cache miss than Kong validating a plain JWT itself — every
-  miss pays an HTTP hop to the Auth Service plus JWE decryption on top of
-  JWT verification.
-- Someone now owns JWE key rotation as a real operational procedure; this
-  POC's ephemeral, regenerate-on-restart key is a shortcut around that, not
-  a solution to it.
-- Kong loses the ability to make claim-based decisions at the edge (ACLs,
-  rate limits keyed off JWT claims) — anything claim-based must happen in
-  the Auth Service or downstream.
-- Kong's claims cache is per-node, not distributed — scaling Kong out
-  horizontally scales up first-miss load on the Auth Service too.
-- More components to keep in sync (Kong plugin, Auth Service mapping code,
-  Keycloak realm/protocol-mapper config) than a single-service check would
-  need, and debugging a live failure means correlating across all three.
-- An extra moving part — Keycloak — to run, patch, and back up, plus the
-  client-side JWE-wrapping step this POC adds since Keycloak doesn't issue
-  JWE-wrapped access tokens natively.
-
-### Step-by-step breakdown
-
-Walking through the four steps in the diagram above — what each one buys
-you, and what it costs, across performance, maintainability, ease of
-extension, ease of governance, and ease of operation.
-
-#### 1. JWE decryption — Auth Service holds the key, Kong never decrypts
-
-- **Performance:** Kong itself does zero crypto — it only hashes the
-  ciphertext for its cache key. The RSA-OAEP + AES-GCM decrypt cost is paid
-  once, in the Auth Service, only on a cache miss.
-- **Governance:** claims are opaque to Kong's access logs and request
-  tracing, so anything downstream of Kong's logging pipeline never
-  sees plaintext identity data — smaller compliance/log-handling surface.
-  The flip side: Kong can't make claim-based decisions either (no
-  claim-aware ACL/rate-limiting at the gateway), since it never sees them.
-- **Operate:** whoever holds the private key owns rotation. This POC's
-  keypair is ephemeral and in-memory — regenerated on every Auth Service
-  restart, which invalidates any JWE minted before the restart — precisely
-  because a real rotation procedure (stage new public key → wait out old
-  tokens → retire old private key) is a production concern this demo
-  sidesteps rather than solves.
-- **Maintain:** one service owns decryption end to end, so there's a single
-  place to change if the encryption scheme (algorithm, key size) ever needs
-  to move.
-
-#### 2. Local JWT verification via cached Keycloak JWKS
-
-- **Performance:** this is the main latency win in the whole design — the
-  common path (`jose.createRemoteJWKSet`) never calls Keycloak at all; it
-  verifies against a JWKS fetched once and cached.
-- **Operate:** that cache (`cacheMaxAge: 600_000` here) means a Keycloak
-  signing-key rotation doesn't propagate to the Auth Service instantly —
-  there's a bounded window where a brand-new signing key wouldn't yet be
-  trusted. Worth knowing before you tune the cache TTL.
-- **Maintain:** `jose` handles fetch-and-cache for you, so this step adds
-  almost no custom code to keep correct.
-- **Extend:** supporting an additional Keycloak realm or a second IdP means
-  wiring another JWKS URL + issuer check — a bounded, well-understood
-  change, not a redesign.
-
-#### 3. Optional, cacheable Keycloak introspection
-
-- **Performance:** strictly opt-in — a route only pays the extra Keycloak
-  round trip if it asks for real-time revocation via
-  `X-Require-Revocation-Check`; everything else skips it entirely.
-- **Governance:** this is the actual governance lever in the design — each
-  route/team can decide, independently, how much revocation freshness it
-  needs, instead of the whole system being locked into one answer.
-- **Operate:** the moment a route turns this on, it takes on a hard runtime
-  dependency on Keycloak's availability for that request (softened by the
-  30s in-memory introspection cache, but not removed).
-- **Extend:** turning stronger revocation checking on for a sensitive route
-  is a config/header change, not new Auth Service code.
-
-#### 4. Kong caches claims, keyed by the hashed JWE, TTL capped by token `exp`
-
-- **Performance:** the other major win — once a token's claims are cached,
-  repeat requests skip the Auth Service round trip (and therefore steps 1–3)
-  entirely until the cache entry expires.
-- **Operate:** the cache is an in-memory shared dict local to each Kong
-  node, not distributed — so scaling Kong out horizontally doesn't share
-  cache hits across replicas, and implicitly scales up first-miss traffic
-  to the Auth Service in proportion to the number of nodes.
-- **Governance:** the TTL is a governance-relevant knob — it bounds how
-  long a request could be served against claims that predate a revocation.
-  Failed/expired lookups are deliberately never cached, trading resilience
-  against abusive traffic for not masking a since-revoked credential.
-- **Maintain:** the caching logic is a single `min(cache_ttl_seconds,
-  exp - now)` rule plus soft-fail-open on cache errors — small enough to
-  read in one sitting.
+Since Keycloak issues plain JWTs (no JWE, no ECDSA envelope), the
+`client-simulator` CLI stands in for "the mobile app": it generates and
+persists a device keypair, enrolls it with the PDS, and drives the full
+Category 1 → Category 2 flow.
 
 ## Requirements
 
@@ -160,121 +92,66 @@ extension, ease of governance, and ease of operation.
 docker compose up --build
 ```
 
-This brings up Keycloak, Kong, the Auth Service, and the Account Service.
-`client-simulator` is not started automatically (it's a one-shot CLI, not a
-long-running service — see below). Wait for Keycloak and Auth Service to
-report healthy:
+This brings up Keycloak, Vault, Postgres, Redis, Kong, `auth-service` (the
+PDS), and `account-service`. `client-simulator` is not started automatically
+(it's a one-shot CLI — see below). Wait for everything to report healthy:
 
 ```bash
 docker compose ps
 ```
 
-Keycloak typically takes 20-40 seconds to become healthy on first start.
+Keycloak typically takes 20-40 seconds to become healthy on first start;
+Vault and Postgres are usually faster.
 
-## Get a JWE test token
-
-```bash
-docker compose run --rm client-simulator demo-user
-```
-
-This logs into Keycloak as `demo-user` / `demo-pass`, encrypts the issued
-access token into a JWE, and prints the JWE plus a ready-to-run curl
-command, e.g.:
+## Run the demo flow
 
 ```bash
-curl -H "Authorization: Bearer <jwe>" http://localhost:8000/api/accounts
+# One-time: generate a device keypair and enroll it with the PDS
+docker compose run --rm client-simulator enroll
+
+# Category 1: log in (Keycloak ROPC inside the PDS), acquire a session + SEK
+docker compose run --rm client-simulator login demo-user
+
+# Category 2: GET /accounts through the PDS (needs account.read)
+docker compose run --rm client-simulator accounts
+
+# Category 2: POST /accounts/transfer (needs account.write — demo-user will get a 403)
+docker compose run --rm client-simulator transfer 250
+
+# Same, but as admin-user (has account.write)
+docker compose run --rm client-simulator login admin-user
+docker compose run --rm client-simulator transfer 250
 ```
 
-Run the printed curl command. Expected HTTP 200 with account data
-(`account.read` scope only).
+Device identity and the current session are persisted in a named Docker
+volume (`client-simulator-data`), so repeated `docker compose run` calls
+reuse the same enrolled device and don't need to re-login every time.
 
-For the admin user (with `account.write` scope):
+## Test tamper detection
 
 ```bash
-docker compose run --rm client-simulator admin-user
+docker compose run --rm client-simulator transfer-tamper 300
 ```
 
-## Test invalid/tampered token
+This flips a byte in the request ciphertext before sending it. Expect
+`HTTP 400` with an *encrypted* error body (`{"error":"payload decryption
+failed"}` or similar) — the PDS detects the corruption before the request
+ever reaches `account-service`.
 
-Take a valid JWE from above and flip a character in it, then:
+## Test session/SEK expiry and failure paths
 
-```bash
-curl -H "Authorization: Bearer <tampered-jwe>" http://localhost:8000/api/accounts
-```
-
-Expected HTTP 401 — JWE decryption/authentication tag verification fails.
-
-## Test expired token
-
-Keycloak access tokens in this realm expire after 2 minutes
-(`accessTokenLifespan` in `keycloak/realm-poc.json`, shortened from the
-default 5 minutes for faster local testing). Wait past that, then re-run a
-previously-printed curl command. Expected HTTP 401.
-
-## Test claims caching
-
-Kong caches successful validation results per-token (keyed by a hash of the
-raw JWE) so repeat requests within the cache TTL (`cache_ttl_seconds`,
-default 60s, capped further by the token's own `exp`) skip the Auth Service
-round trip entirely.
-
-```bash
-curl -H "Authorization: Bearer <jwe>" http://localhost:8000/api/accounts
-curl -H "Authorization: Bearer <jwe>" http://localhost:8000/api/accounts
-docker compose logs auth-service --since 1m
-```
-
-You should see only one `/validate called (correlation_id=...)` line for the
-pair of requests — the second request was served from Kong's shared-memory
-cache without calling the Auth Service. Wait past the TTL and repeat to see
-it call through again.
-
-## Test payload encryption (request and response)
-
-Beyond the token, `POST /api/accounts/transfer` also encrypts the request
-body — using the *same* Auth Service key already used for the token. Kong
-forwards the encrypted request body to Auth Service alongside the token;
-Auth Service decrypts both and hands Kong back plaintext, which Kong writes
-into the request before it ever reaches Account Service (see
-`docs/encryption-workflow.md` for the full sequence).
-
-The response is encrypted too, but with a *different* key, and by a
-*different* component: `client-simulator` generates a one-off RSA-OAEP
-keypair per request and sends the public half as a plain `X-Response-Pubkey`
-header (it grants no authority — it just says "encrypt the answer to this" —
-so it needs no trust check). Account Service replies with ordinary
-plaintext JSON, same as `/accounts`; Kong's `custom-auth` plugin picks up
-the full response body in its buffered `response` phase and encrypts it
-with that key (RSA-OAEP-256 + A256GCM, hand-assembled into a compact JWE
-using `resty.openssl` — see `kong/plugins/custom-auth/handler.lua`) before
-it reaches the client. The client decrypts locally with the private half,
-which never left the process. Doing the encryption in Kong rather than
-Account Service keeps Account Service free of crypto code on both the
-request and response side; it also avoids the round trip you'd need if the
-response were encrypted with Auth Service's key instead (only Auth Service
-could then decrypt it). This can be turned off per-route via the plugin's
-`encrypt_response` config (default `true`).
-
-```bash
-docker compose run --rm client-simulator demo-user transfer 250
-```
-
-This mints a token, encrypts a demo `{ to, amount }` transfer request with
-Auth Service's public key, and POSTs it to Kong along with a fresh
-response-decryption public key. `demo-user` only has `account.read`, so
-expect a `403`; try `admin-user` (has `account.write`) for a `200` with the
-decrypted transfer confirmation printed to the console.
-
-Note: this endpoint's request encryption is intentionally excluded from
-Kong's claims cache — a POST body is unique per request, so caching a
-decrypted payload under the token's cache key would risk replaying a stale
-payload onto a later request that reuses the same token.
-
-To see a corrupted payload get rejected (`400`, not silently wrong data):
-
-```bash
-docker compose run --rm client-simulator admin-user transfer-tamper 300
-```
+- **Invalid/expired `sessionJwt`**: wait past the 4-hour session lifetime
+  (or hand-edit a stored `sessionJwt`) and re-run `accounts`/`transfer` —
+  expect `HTTP 401`, returned as **plaintext** JSON (no SEK is trusted yet
+  at that point, so there's nothing to encrypt the error with).
+- **Redis down**: `docker stop redis`, then re-run `accounts` — it should
+  still succeed via the Postgres fallback (`auth-service` logs a warning,
+  not an error).
+- **Postgres down, cold Redis cache**: stop both `redis` and `postgres`,
+  then run `accounts` for a session that was never cached — expect
+  `HTTP 500` plaintext (`{"error":"session store unavailable"}`).
+- **New login while Postgres is down**: `login` will fail with `HTTP 500`
+  plaintext — the PDS can't durably store a new SEK.
 
 ## Inspect Kong
 
@@ -282,6 +159,13 @@ Kong Admin API:
 
 ```bash
 curl http://localhost:8001
+```
+
+## Inspect the session store
+
+```bash
+docker exec postgres psql -U pds -d pds -c \
+  "SELECT session_id, expiration_bucket, created_at FROM session_encryption_key;"
 ```
 
 ## Stop
@@ -294,60 +178,68 @@ docker compose down
 
 This POC intentionally takes shortcuts for local runnability. For production:
 
-1. Use TLS/mTLS between Kong and Custom Auth Service.
-2. The Auth Service's JWE decryption keypair is generated fresh, in-memory,
-   on every restart — any JWE encrypted before a restart becomes
-   permanently undecryptable. Use a persisted, rotated key (KMS/HSM) instead.
-3. The `client-simulator` uses a Resource Owner Password Credentials grant
-   purely for local test-token minting. Real clients must use an
-   authorization-code + PKCE flow — never ROPC — and should never handle
-   raw user credentials directly.
+1. Vault runs in dev mode (unsealed, single root token, in-memory storage).
+   Use a real storage backend and an AppRole policy scoped to only the
+   `pds/*` paths this service touches.
+2. Device enrollment (`POST /pds/device/enrollment`) has no real attestation
+   — it's a bare "post your public key, get a JWT" endpoint. A production
+   system needs App Attest / Play Integrity or hardware-backed key
+   attestation before trusting a device's claimed public key.
+3. `client-simulator`'s Category 1 login payload is a raw
+   `{username, password}` — fine for a POC standing in for "the mobile app
+   sends its own credentials to the PDS to relay via ROPC," but real clients
+   should never hand raw passwords to any service; use an authorization-code
+   + PKCE flow at the Keycloak layer instead.
 4. Keycloak runs in `start-dev` mode with an in-memory H2 database and
-   `sslRequired: none`. This is not production-safe — use a real database,
-   TLS, and a hardened realm configuration.
-5. Roles and scopes are both modeled as plain Keycloak realm roles
-   (`customer`/`admin`/`account.read`/`account.write`), filtered by name in
-   the Auth Service. A production setup should use dedicated OAuth2 scopes
-   with proper client-scope protocol mappers instead.
-6. Kong's claims cache is per-node, in-memory, and only caches successful
-   validations (no negative/failure caching, to avoid masking a
-   since-revoked credential behind a longer TTL than intended).
-7. Do not trust client-supplied identity headers — the plugin explicitly
-   clears them before setting trusted values.
-8. Keep the Auth Service inaccessible from the Internet.
-9. Add circuit-breaker behavior for Keycloak/Auth Service outages beyond
-   the existing request timeout.
-10. Add audit logging without logging credentials or raw tokens.
-11. Keep business authorization in the owning microservice.
-12. `/accounts/transfer`'s response encryption key is a keypair generated
-    fresh, in-memory, per CLI run — real clients need a way to persist and
-    reuse (or re-derive) their own keypair, and the server-side header that
-    carries the public key (`X-Response-Pubkey`) should be size-bounded and
-    validated before being trusted as a JWK.
-13. Kong's response encryption fails open: if `X-Response-Pubkey` is
-    malformed or encryption errors out, the plugin logs a warning and
-    returns the response as plaintext rather than blocking it. That's
-    convenient for a demo but means a client that *believes* it asked for
-    an encrypted response has no guarantee it got one — a production setup
-    should either fail closed (reject the request) or give the client an
-    explicit signal (e.g. a response header) confirming encryption
-    happened.
+   `sslRequired: none`. Use a real database, TLS, and a hardened realm.
+5. Real-time revocation checking is not implemented — session validity is
+   bounded only by the 4-hour `sessionJwt`/SEK lifetime. A production
+   system may want a revocation list or shorter-lived sessions for
+   sensitive operations.
+6. The device keypair is reused for both ECDSA signing and as the
+   `ECDH-ES+A256KW` target for the Category 1 response, rather than
+   separate keys per purpose — see `docs/encryption-workflow.md`'s
+   deviations section.
+7. Multipart/form-data payload encryption (file uploads) is not
+   implemented; `/pds/bff/*` returns `501` for that content type.
+8. Postgres is a single table with a `DELETE`-based hourly cleanup, not the
+   spec's SQL-Server memory-optimized, physically partitioned table.
+9. Keep TLS/mTLS between Kong, `auth-service`, `account-service`, Vault,
+   Postgres, and Redis — this POC runs them all in plaintext on a local
+   Docker network.
+10. Do not trust client-supplied identity headers — Kong's `custom-auth`
+    plugin builds the `account-service` request from scratch (method, path,
+    and a fresh headers table populated only from the PDS's verify
+    response), so it never copies the client's original request headers
+    through; nothing the client sends can end up as `X-User-*`. Still, make
+    sure `account-service` is never reachable except through this plugin
+    (it has no host port mapping in `docker-compose.yml`, but production
+    needs network policy enforcing that too).
+11. Keep business authorization in the owning microservice (already true
+    here — `account-service` checks scopes itself).
+12. Add circuit-breaker behavior for Keycloak/Postgres/Redis/account-service
+    outages beyond the existing per-call timeouts.
+13. Add audit logging without logging credentials, raw tokens, or SEKs.
+14. Category 2/3 traffic costs two PDS round trips per request (verify,
+    then encrypt-response) because Kong — not the PDS — makes the call to
+    `account-service`. That's a deliberate trade for having Kong visibly
+    gate access and own the proxy hop; a lower-latency alternative is
+    having the PDS call `account-service` itself in one pass (this repo did
+    exactly that in an earlier iteration — see `docs/encryption-workflow.md`
+    deviations section for the trade-off).
 
 ## Main architectural decision
 
-Kong is the API security enforcement point. On the request side it's a
-dumb JWE pass-through — it never decrypts the token or the request body.
-On the response side, for routes that opt in, it performs one exception to
-that rule: encrypting the plaintext response with a client-supplied public
-key. That's a deliberate asymmetry, not an oversight — encrypting *for*
-someone is a public-key operation that needs no secret of Kong's own, so it
-doesn't reopen the "Kong holds no key material" property that motivates
-keeping decryption out of Kong.
+The PDS (`auth-service`) is the only place that ever touches key material —
+Vault-held keys, the SEK-wrap KEK, per-session SEKs — end to end. Kong holds
+no keys and never encrypts or decrypts on its own; for Category 1 it's a
+pure pass-through, and for Category 2/3 its `custom-auth` plugin actively
+checks with the PDS that auth is complete before forwarding to
+`account-service` itself, then hands the reply back to the PDS to encrypt.
+`account-service` sits behind Kong and stays completely free of crypto code,
+on both the request and response side, trusting only the headers the plugin
+sets after the PDS has verified a session.
 
-The Custom Authentication Service owns authentication: JWE decryption
-(token and request payload), local JWT/JWKS verification, and optional
-Keycloak introspection.
-
-The microservice owns resource/business authorization, and stays free of
-crypto code entirely — both request decryption and response encryption
-happen outside it.
+See `docs/encryption-workflow.md` for the full request/response sequence
+diagrams, the binary envelope byte layout, the key-material inventory, and
+an explicit list of where this implementation simplifies the spec.

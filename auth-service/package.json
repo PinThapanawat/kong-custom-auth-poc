@@ -4,15 +4,23 @@
   "private": true,
   "scripts": {
     "start": "node dist/server.js",
-    "build": "tsc"
+    "build": "tsc",
+    "test": "tsc && node --test dist/pds/__tests__/*.test.js"
   },
   "dependencies": {
     "express": "^5.1.0",
-    "jose": "^4.15.9"
+    "ioredis": "^5.11.1",
+    "jose": "^4.15.9",
+    "node-cron": "^3.0.3",
+    "node-vault": "^0.12.0",
+    "pg": "^8.23.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^22.15.21",
+    "@types/node-cron": "^3.0.11",
+    "@types/node-vault": "^0.9.13",
+    "@types/pg": "^8.21.0",
     "typescript": "^5.8.3"
   }
 }

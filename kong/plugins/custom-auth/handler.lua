@@ -1,351 +1,168 @@
 local http = require "resty.http"
 local cjson = require "cjson.safe"
-local pkey_lib = require "resty.openssl.pkey"
-local cipher_lib = require "resty.openssl.cipher"
-local rand = require "resty.openssl.rand"
+
+-- Category 2/3 BFF traffic (PDF pp.4-5), brokered by Kong instead of the
+-- PDS calling account-service itself: this plugin calls the PDS
+-- (auth-service) to check auth is complete and get back plaintext + trusted
+-- headers, forwards the now-plaintext request to account-service itself,
+-- then calls the PDS a second time to re-encrypt the reply before it goes
+-- back to the client. The SEK never leaves the PDS/Vault boundary — Kong
+-- only ever sees ciphertext coming in and going out, and plaintext for the
+-- single hop to account-service in between.
+--
+-- Everything happens in `access`, including the account-service call: this
+-- plugin makes its own resty.http request to account-service rather than
+-- relying on Kong's declarative service/upstream proxying, so that a
+-- connection failure or timeout talking to account-service is caught right
+-- here as a normal Lua error instead of depending on how (or whether) a
+-- given Kong version invokes response-phase handlers for its own
+-- internally generated error pages. `kong.response.exit` always sends the
+-- final answer; Kong's core proxy phase for this route never runs.
 
 local CustomAuthHandler = {
   PRIORITY = 1000,
   VERSION = "1.0.0",
 }
 
--- OpenSSL's RSA_PKCS1_OAEP_PADDING, hardcoded rather than pulled from a
--- resty.openssl constants table since the exact export path has moved
--- across library versions; the numeric padding ID is stable OpenSSL ABI.
-local RSA_PKCS1_OAEP_PADDING = 4
-
-local function b64url_encode(s)
-  local encoded = ngx.encode_base64(s)
-  encoded = encoded:gsub("+", "-"):gsub("/", "_"):gsub("=", "")
-  return encoded
+local function plaintext_error_exit(status, message)
+  return kong.response.exit(status, cjson.encode({ error = message }), { ["Content-Type"] = "application/json" })
 end
 
-local function b64url_decode(s)
-  local padded = s:gsub("-", "+"):gsub("_", "/")
-  local rem = #padded % 4
-  if rem == 2 then
-    padded = padded .. "=="
-  elseif rem == 3 then
-    padded = padded .. "="
-  end
-  return ngx.decode_base64(padded)
-end
-
--- Imports the client's public key from the X-Response-Pubkey request
--- header (base64url-encoded JSON JWK). A public key grants no authority
--- (only its matching private key, held by the client, can decrypt), so
--- Kong trusts it without any authentication check. Done in header_filter,
--- before any body has arrived, so the Content-Type decision and the
--- actual encryption can never disagree about whether encryption is
--- happening.
-local function import_response_pubkey(pubkey_b64url)
-  local jwk_json = b64url_decode(pubkey_b64url)
-  if not jwk_json then
-    return nil, "invalid X-Response-Pubkey encoding"
-  end
-
-  local jwk, decode_err = cjson.decode(jwk_json)
-  if not jwk or decode_err then
-    return nil, "invalid X-Response-Pubkey JSON"
-  end
-
-  local pkey, pkey_err = pkey_lib.new(jwk_json, { format = "JWK" })
-  if not pkey then
-    return nil, "invalid public key: " .. (pkey_err or "unknown error")
-  end
-
-  return pkey
-end
-
--- Encrypts `plaintext` into a compact JWE (RSA-OAEP-256 key wrap +
--- A256GCM content encryption) for the holder of `pkey`. Wire-compatible
--- with `jose.compactDecrypt` on the client side.
-local function encrypt_response_for_client(pkey, plaintext)
-  local protected = cjson.encode({ alg = "RSA-OAEP-256", enc = "A256GCM" })
-  local protected_b64 = b64url_encode(protected)
-
-  local cek = rand.bytes(32)
-  local iv = rand.bytes(12)
-  if not cek or not iv then
-    return nil, "failed to generate random key material"
-  end
-
-  local encrypted_key, ek_err = pkey:encrypt(cek, RSA_PKCS1_OAEP_PADDING, {
-    oaep_md = "sha256",
-    mgf1_md = "sha256"
-  })
-  if not encrypted_key then
-    return nil, "key wrap failed: " .. (ek_err or "unknown error")
-  end
-
-  local cipher, cipher_err = cipher_lib.new("aes-256-gcm")
-  if not cipher then
-    return nil, "cipher init failed: " .. (cipher_err or "unknown error")
-  end
-
-  -- AAD per the JWE spec: ASCII(BASE64URL(UTF8(protected header))).
-  local ciphertext, enc_err = cipher:encrypt(cek, iv, plaintext, false, protected_b64)
-  if not ciphertext then
-    return nil, "content encryption failed: " .. (enc_err or "unknown error")
-  end
-
-  local tag, tag_err = cipher:get_aead_tag()
-  if not tag then
-    return nil, "tag retrieval failed: " .. (tag_err or "unknown error")
-  end
-
-  return table.concat({
-    protected_b64,
-    b64url_encode(encrypted_key),
-    b64url_encode(iv),
-    b64url_encode(ciphertext),
-    b64url_encode(tag)
-  }, ".")
-end
-
--- Declared via KONG_NGINX_HTTP_LUA_SHARED_DICT="custom_auth_cache 10m".
--- Kong's own kong.cache/mlcache does not honor per-key TTLs in DB-less mode,
--- so claims caching is done directly against this shared dict instead.
-local CACHE_DICT_NAME = "custom_auth_cache"
-
-local function unauthorized(message)
-  return kong.response.exit(401, {
-    message = message or "Unauthorized"
-  }, {
-    ["WWW-Authenticate"] = "Bearer"
-  })
-end
-
--- Kong never decrypts the JWE; the raw ciphertext is only ever hashed to
--- form a cache lookup key.
-local function cache_key(raw_token)
-  return "custom_auth:" .. ngx.md5(raw_token)
-end
-
-local function get_cached_auth(dict, token)
-  if not dict then
-    return nil
-  end
-
-  local cached, err = dict:get(cache_key(token))
-  if err then
-    kong.log.warn("custom-auth cache get error: ", err)
-    return nil
-  end
-
-  if not cached then
-    return nil
-  end
-
-  local auth, decode_err = cjson.decode(cached)
-  if not auth or decode_err then
-    return nil
-  end
-
-  return auth
-end
-
-local function store_cached_auth(dict, token, auth, max_ttl_seconds)
-  if not dict then
-    return
-  end
-
-  local ttl = max_ttl_seconds
-
-  if type(auth.exp) == "number" then
-    local remaining = auth.exp - ngx.time()
-    if remaining <= 0 then
-      return
+local function strip_prefix(path, prefix)
+  if path:sub(1, #prefix) == prefix then
+    local rest = path:sub(#prefix + 1)
+    if rest == "" then
+      return "/"
     end
-    ttl = math.min(ttl, remaining)
+    return rest
   end
-
-  local ok, err = dict:set(cache_key(token), cjson.encode(auth), ttl)
-  if not ok then
-    kong.log.warn("custom-auth cache set error: ", err)
-  end
+  return path
 end
 
 function CustomAuthHandler:access(conf)
+  local content_type = kong.request.get_header("Content-Type") or ""
+  if content_type:find("multipart/form%-data", 1, true) then
+    return kong.response.exit(501, cjson.encode({
+      error = "multipart/form-data payload encryption is not implemented in this POC — see docs/encryption-workflow.md"
+    }), { ["Content-Type"] = "application/json" })
+  end
+
   local authorization = kong.request.get_header("Authorization")
+  local session_jwt = authorization and authorization:match("^Bearer%s+(.+)$") or nil
 
-  if not authorization then
-    return unauthorized("Missing Authorization header")
-  end
-
-  local token = authorization:match("^Bearer%s+(.+)$")
-
-  if not token then
-    return unauthorized("Invalid Authorization header")
-  end
-
-  -- A request body is unique per-request (unlike the token, which repeats
-  -- across many requests), so it is never cached: caching a decrypted
-  -- payload under the token's cache key would replay a stale payload onto
-  -- a later request that reuses the same token with different content.
   local raw_body = kong.request.get_raw_body()
-  local has_payload = raw_body ~= nil and raw_body ~= ""
+  local method = kong.request.get_method()
+  local full_path = kong.request.get_path()
+  local upstream_path = strip_prefix(full_path, "/pds/bff")
+  local request_unique_id = kong.request.get_header("X-Client-Transaction-Id")
 
-  local dict = (conf.enable_cache and not has_payload) and ngx.shared[CACHE_DICT_NAME] or nil
-  local auth = get_cached_auth(dict, token)
+  local httpc = http.new()
+  httpc:set_timeout(conf.timeout_ms)
 
-  if not auth then
-    local httpc = http.new()
-    httpc:set_timeout(conf.timeout_ms)
+  -- Step 1 (verify with the PDS): sessionJwt validity, SEK lookup, payload
+  -- decryption, envelope signature, apiId — everything the PDS alone can
+  -- check, since only it (via Vault) ever touches key material.
+  local verify_res, verify_err = httpc:request_uri(conf.pds_verify_url, {
+    method = "POST",
+    body = cjson.encode({
+      sessionJwt = session_jwt,
+      jwe = raw_body,
+      method = method,
+      upstreamPath = upstream_path,
+      requestUniqueId = request_unique_id,
+    }),
+    headers = {
+      ["Content-Type"] = "application/json",
+      ["X-Auth-Caller"] = "kong",
+    },
+    keepalive = true,
+  })
 
-    local body = {
-      token = token,
-      method = kong.request.get_method(),
-      path = kong.request.get_path(),
-      correlation_id = kong.request.get_header("X-Correlation-ID")
-    }
-
-    if has_payload then
-      body.payload = raw_body
-    end
-
-    local res, err = httpc:request_uri(conf.auth_service_url, {
-      method = "POST",
-      body = cjson.encode(body),
-      headers = {
-        ["Content-Type"] = "application/json",
-        ["X-Auth-Caller"] = "kong"
-      },
-      keepalive = true
-    })
-
-    if not res then
-      kong.log.err("Authentication service unavailable: ", err)
-      return kong.response.exit(503, {
-        message = "Authentication service unavailable"
-      })
-    end
-
-    if res.status == 401 then
-      return unauthorized("Invalid or expired credential")
-    end
-
-    if res.status ~= 200 then
-      kong.log.err("Authentication service returned status ", res.status)
-      return kong.response.exit(503, {
-        message = "Authentication service error"
-      })
-    end
-
-    local decode_err
-    auth, decode_err = cjson.decode(res.body)
-
-    if not auth or decode_err then
-      kong.log.err("Invalid authentication service response")
-      return kong.response.exit(503, {
-        message = "Invalid authentication service response"
-      })
-    end
-
-    if auth.authenticated == true and not has_payload then
-      store_cached_auth(dict, token, auth, conf.cache_ttl_seconds)
-    end
+  if not verify_res then
+    kong.log.err("PDS verify call failed: ", verify_err)
+    return plaintext_error_exit(502, "auth service unavailable")
   end
 
-  if auth.authenticated ~= true then
-    return unauthorized("Authentication failed")
+  local verify_result, verify_decode_err = cjson.decode(verify_res.body)
+  if not verify_result or verify_decode_err then
+    kong.log.err("PDS verify returned an invalid response")
+    return plaintext_error_exit(502, "invalid auth service response")
   end
 
-  if auth.payload_error == true then
-    return kong.response.exit(400, {
-      message = "Invalid encrypted payload"
+  if verify_result.outcome ~= "authenticated" then
+    return kong.response.exit(verify_result.httpStatus, verify_result.responseBody, {
+      ["Content-Type"] = verify_result.responseContentType,
     })
   end
 
-  if type(auth.payload_plaintext) == "string" then
-    kong.service.request.set_raw_body(auth.payload_plaintext)
-    kong.service.request.set_header("Content-Type", "application/json")
+  -- Step 2 (forward the plaintext request to account-service ourselves).
+  local plaintext_body = ""
+  if verify_result.plaintextRequestBodyBase64 and verify_result.plaintextRequestBodyBase64 ~= "" then
+    plaintext_body = ngx.decode_base64(verify_result.plaintextRequestBodyBase64) or ""
   end
 
-  local user = auth.user or {}
-  local authorization_context = auth.authorization or {}
-
-  -- Remove client-supplied identity headers before setting trusted values.
-  kong.service.request.clear_header("X-User-ID")
-  kong.service.request.clear_header("X-Client-ID")
-  kong.service.request.clear_header("X-User-Roles")
-  kong.service.request.clear_header("X-User-Scopes")
-  kong.service.request.clear_header("X-Auth-Authenticated")
-
-  kong.service.request.set_header("X-User-ID", tostring(user.id or ""))
-  kong.service.request.set_header("X-Client-ID", tostring(user.client_id or ""))
-  kong.service.request.set_header(
-    "X-User-Roles",
-    table.concat(authorization_context.roles or {}, ",")
-  )
-  kong.service.request.set_header(
-    "X-User-Scopes",
-    table.concat(authorization_context.scopes or {}, ",")
-  )
-  kong.service.request.set_header("X-Auth-Authenticated", "true")
-end
-
--- header_filter decides *whether* to encrypt, before any response body has
--- arrived: only for successful responses carrying the client's one-off
--- public key (X-Response-Pubkey, set by the client on the original
--- request). Errors (401/403/503 etc.) and requests without that header
--- pass through untouched. The imported key is stashed in the
--- request-scoped plugin context so body_filter — which runs later, once
--- per response chunk — doesn't need to re-parse the header, and so the
--- Content-Type set here can never disagree with what body_filter actually
--- does to the body.
-function CustomAuthHandler:header_filter(conf)
-  if not conf.encrypt_response then
-    return
+  local account_headers = {
+    ["X-User-ID"] = verify_result.userId or "",
+    ["X-Client-ID"] = verify_result.clientId or "",
+    ["X-User-Roles"] = table.concat(verify_result.roles or {}, ","),
+    ["X-User-Scopes"] = table.concat(verify_result.scopes or {}, ","),
+    ["X-Auth-Authenticated"] = "true",
+  }
+  local has_body = method ~= "GET" and method ~= "HEAD" and #plaintext_body > 0
+  if has_body then
+    account_headers["Content-Type"] = "application/json"
   end
 
-  if kong.response.get_status() ~= 200 then
-    return
+  local acct_httpc = http.new()
+  acct_httpc:set_timeout(conf.timeout_ms)
+  local acct_res, acct_err = acct_httpc:request_uri(conf.account_service_url .. upstream_path, {
+    method = method,
+    body = has_body and plaintext_body or nil,
+    headers = account_headers,
+    keepalive = true,
+  })
+
+  local response_status
+  local response_plaintext
+  if not acct_res then
+    kong.log.err("account-service call failed: ", acct_err)
+    local is_timeout = acct_err and acct_err:find("timeout", 1, true) ~= nil
+    response_status = is_timeout and 504 or 502 -- PDF p.5 steps 6.1/6.2
+    response_plaintext = cjson.encode({ error = is_timeout and "upstream timeout" or "upstream unavailable" })
+  else
+    response_status = acct_res.status
+    response_plaintext = acct_res.body or ""
   end
 
-  local pubkey_header = kong.request.get_header("X-Response-Pubkey")
-  if not pubkey_header then
-    return
+  -- Step 3 (re-encrypt the reply via the PDS — Kong never holds the SEK).
+  local encrypt_res, encrypt_err = httpc:request_uri(conf.pds_encrypt_response_url, {
+    method = "POST",
+    body = cjson.encode({
+      sessionId = verify_result.sessionId,
+      requestUniqueId = verify_result.requestUniqueId,
+      plaintextBodyBase64 = ngx.encode_base64(response_plaintext),
+    }),
+    headers = {
+      ["Content-Type"] = "application/json",
+      ["X-Auth-Caller"] = "kong",
+    },
+    keepalive = true,
+  })
+
+  if not encrypt_res or encrypt_res.status ~= 200 then
+    kong.log.err("PDS encrypt-response call failed: ", encrypt_err or (encrypt_res and encrypt_res.status))
+    return plaintext_error_exit(500, "response encryption failed")
   end
 
-  local pkey, err = import_response_pubkey(pubkey_header)
-  if not pkey then
-    kong.log.warn("Response encryption skipped: ", err)
-    return
+  local encrypt_result, encrypt_decode_err = cjson.decode(encrypt_res.body)
+  if not encrypt_result or encrypt_decode_err or not encrypt_result.responseJwe then
+    kong.log.err("PDS encrypt-response returned an invalid response")
+    return plaintext_error_exit(500, "invalid auth service response")
   end
 
-  kong.ctx.plugin.response_pkey = pkey
-  kong.response.set_header("Content-Type", "application/jwe")
-  kong.response.clear_header("Content-Length")
-end
-
--- body_filter runs once per response chunk; kong.response.get_raw_body()
--- buffers them internally and only returns the full body once the last
--- chunk has arrived (nil on every call before that).
-function CustomAuthHandler:body_filter(conf)
-  local pkey = kong.ctx.plugin.response_pkey
-  if not pkey then
-    return
-  end
-
-  local body = kong.response.get_raw_body()
-  if not body then
-    return
-  end
-
-  local jwe, err = encrypt_response_for_client(pkey, body)
-  if not jwe then
-    -- Content-Type was already committed to application/jwe in
-    -- header_filter, so failing silently here would ship a body that
-    -- doesn't match it. Surface it as plaintext content, even though the
-    -- header now claims JWE — this is the only place there's genuinely
-    -- no clean recovery from a body-stage failure.
-    kong.log.err("Response encryption failed after committing to it: ", err)
-    kong.response.set_raw_body(body)
-    return
-  end
-
-  kong.response.set_raw_body(jwe)
+  return kong.response.exit(response_status, encrypt_result.responseJwe, {
+    ["Content-Type"] = "application/jose",
+  })
 end
 
 return CustomAuthHandler

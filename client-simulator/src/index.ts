@@ -1,137 +1,72 @@
-import * as jose from "jose";
+import { ensureDeviceIdentity, acquireSession, loadSession, callBffApi } from "./pdsClient";
+import { API_IDS } from "./apiRegistry";
 
-const KEYCLOAK_TOKEN_URL =
-  process.env.KEYCLOAK_TOKEN_URL ?? "http://keycloak:8080/realms/poc/protocol/openid-connect/token";
-const AUTH_SERVICE_JWE_JWKS_URL =
-  process.env.AUTH_SERVICE_JWE_JWKS_URL ?? "http://auth-service:8080/.well-known/jwe-jwks.json";
-const KONG_URL = process.env.KONG_URL ?? "http://localhost:8000/api/accounts";
-const KONG_INTERNAL_API_URL = process.env.KONG_INTERNAL_API_URL ?? "http://kong:8000/api";
-const KEYCLOAK_CLIENT_ID = process.env.KEYCLOAK_CLIENT_ID ?? "poc-client";
+const PDS_BASE_URL = process.env.PDS_BASE_URL ?? "http://kong:8000";
 
 const DEMO_USERS: Record<string, string> = {
   "demo-user": "demo-pass",
   "admin-user": "admin-pass"
 };
 
-async function login(username: string, password: string): Promise<string> {
-  const tokenResp = await fetch(KEYCLOAK_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "password",
-      client_id: KEYCLOAK_CLIENT_ID,
-      username,
-      password
-    })
-  });
-
-  if (!tokenResp.ok) {
-    throw new Error(`Keycloak login failed: ${tokenResp.status} ${await tokenResp.text()}`);
-  }
-
-  const { access_token: accessToken } = (await tokenResp.json()) as { access_token: string };
-  return accessToken;
-}
-
-async function fetchAuthServicePublicKey(): Promise<jose.KeyLike> {
-  const jwksResp = await fetch(AUTH_SERVICE_JWE_JWKS_URL);
-  if (!jwksResp.ok) {
-    throw new Error(`Failed to fetch Auth Service JWKS: ${jwksResp.status}`);
-  }
-  const { keys } = (await jwksResp.json()) as { keys: jose.JWK[] };
-  return (await jose.importJWK(keys[0], "RSA-OAEP-256")) as jose.KeyLike;
-}
-
-async function encryptFor(publicKey: jose.KeyLike, plaintext: string): Promise<string> {
-  return new jose.CompactEncrypt(new TextEncoder().encode(plaintext))
-    .setProtectedHeader({ alg: "RSA-OAEP-256", enc: "A256GCM" })
-    .encrypt(publicKey);
-}
-
-async function runGetAccountsDemo(username: string, accessToken: string) {
-  console.error("Fetching Auth Service JWE public key...");
-  const authServicePublicKey = await fetchAuthServicePublicKey();
-
-  console.error("Encrypting access token as JWE...");
-  const jwe = await encryptFor(authServicePublicKey, accessToken);
-
-  console.log(`\nJWE for ${username}:\n${jwe}\n`);
-  console.log(`curl -H "Authorization: Bearer ${jwe}" ${KONG_URL}\n`);
-}
-
-async function runTransferDemo(username: string, accessToken: string, amount: number, tamper = false) {
-  console.error("Fetching Auth Service JWE public key (same key used for the token)...");
-  const authServicePublicKey = await fetchAuthServicePublicKey();
-
-  console.error("Encrypting token...");
-  const tokenJwe = await encryptFor(authServicePublicKey, accessToken);
-
-  console.error("Encrypting request payload with the same key...");
-  const payload = JSON.stringify({ to: "ACC-77002", amount });
-  let payloadJwe = await encryptFor(authServicePublicKey, payload);
-
-  if (tamper) {
-    const parts = payloadJwe.split(".");
-    const ct = parts[3];
-    parts[3] = (ct[5] === "A" ? "B" : "A") + ct.slice(1);
-    payloadJwe = parts.join(".");
-    console.error("TAMPERED: flipped a character in the payload ciphertext");
-  }
-
-  // A per-request keypair for the *response*: unlike the token/request key
-  // (Auth Service's), this one is ours, so we're the only ones who can
-  // read what comes back. The public half rides along as a plain header —
-  // it grants no authority, it just says "encrypt the answer to this".
-  console.error("Generating a one-off keypair for the response...");
-  const { publicKey: responsePublicKey, privateKey: responsePrivateKey } = await jose.generateKeyPair(
-    "RSA-OAEP-256",
-    { extractable: true }
-  );
-  const responsePublicJwk = await jose.exportJWK(responsePublicKey);
-  const responsePubkeyHeader = Buffer.from(JSON.stringify(responsePublicJwk)).toString("base64url");
-
-  console.error(`POSTing encrypted transfer request as ${username}...`);
-  const resp = await fetch(`${KONG_INTERNAL_API_URL}/accounts/transfer`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${tokenJwe}`,
-      "Content-Type": "application/jwe",
-      "X-Response-Pubkey": responsePubkeyHeader
-    },
-    body: payloadJwe
-  });
-
-  const responseBody = await resp.text();
-
-  if (resp.headers.get("content-type")?.includes("application/jwe")) {
-    console.error("Decrypting response with our private key...");
-    const { plaintext } = await jose.compactDecrypt(responseBody, responsePrivateKey);
-    console.log(`\nHTTP ${resp.status}: ${new TextDecoder().decode(plaintext)}\n`);
-  } else {
-    console.log(`\nHTTP ${resp.status}: ${responseBody}\n`);
-  }
+function printResult(label: string, result: { status: number; body: unknown }) {
+  console.log(`\n${label} -> HTTP ${result.status}: ${JSON.stringify(result.body, null, 2)}\n`);
 }
 
 async function main() {
-  const [username, mode, amountArg] = process.argv.slice(2);
+  const [command, ...rest] = process.argv.slice(2);
 
-  if (!username || !DEMO_USERS[username]) {
-    console.error(`Usage: client-simulator <${Object.keys(DEMO_USERS).join("|")}> [transfer|transfer-tamper <amount>]`);
-    process.exit(1);
+  if (command === "enroll") {
+    const { identity } = await ensureDeviceIdentity(PDS_BASE_URL);
+    console.log(`Device enrolled: ${identity.deviceId}`);
+    return;
   }
 
-  console.error(`Logging into Keycloak as ${username}...`);
-  const accessToken = await login(username, DEMO_USERS[username]);
-
-  if (mode === "transfer") {
-    const amount = Number(amountArg ?? 100);
-    await runTransferDemo(username, accessToken, amount);
-  } else if (mode === "transfer-tamper") {
-    const amount = Number(amountArg ?? 100);
-    await runTransferDemo(username, accessToken, amount, true);
-  } else {
-    await runGetAccountsDemo(username, accessToken);
+  if (command === "login") {
+    const [username] = rest;
+    if (!username || !DEMO_USERS[username]) {
+      console.error(`Usage: client-simulator login <${Object.keys(DEMO_USERS).join("|")}>`);
+      process.exit(1);
+    }
+    const { identity, privateKey } = await ensureDeviceIdentity(PDS_BASE_URL);
+    console.error(`Acquiring session as ${username} (Category 1: Session Acquiring API)...`);
+    const session = await acquireSession(PDS_BASE_URL, identity, privateKey, username, DEMO_USERS[username]);
+    console.log(`Session acquired. sessionJwt: ${session.sessionJwt.slice(0, 40)}...`);
+    return;
   }
+
+  if (command === "accounts") {
+    const { privateKey } = await ensureDeviceIdentity(PDS_BASE_URL);
+    const session = loadSession();
+    const result = await callBffApi(PDS_BASE_URL, privateKey, session, "GET", "/accounts", API_IDS.ACCOUNTS_LIST);
+    printResult("GET /accounts", result);
+    return;
+  }
+
+  if (command === "transfer" || command === "transfer-tamper") {
+    const amount = Number(rest[0] ?? 100);
+    const { privateKey } = await ensureDeviceIdentity(PDS_BASE_URL);
+    const session = loadSession();
+    const result = await callBffApi(
+      PDS_BASE_URL,
+      privateKey,
+      session,
+      "POST",
+      "/accounts/transfer",
+      API_IDS.ACCOUNTS_TRANSFER,
+      { to: "ACC-77002", amount },
+      command === "transfer-tamper"
+    );
+    printResult("POST /accounts/transfer", result);
+    return;
+  }
+
+  console.error("Usage: client-simulator <enroll|login|accounts|transfer|transfer-tamper> [args]");
+  console.error(`  enroll                          Generate/persist a device keypair and enroll it with the PDS`);
+  console.error(`  login <${Object.keys(DEMO_USERS).join("|")}>       Category 1: acquire a session + SEK`);
+  console.error(`  accounts                        Category 2: GET /accounts through the PDS`);
+  console.error(`  transfer [amount]                Category 2: POST /accounts/transfer through the PDS`);
+  console.error(`  transfer-tamper [amount]         Same, but flips a ciphertext byte to prove tamper detection`);
+  process.exit(1);
 }
 
 main().catch((err) => {
