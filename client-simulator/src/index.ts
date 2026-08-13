@@ -78,17 +78,38 @@ async function runTransferDemo(username: string, accessToken: string, amount: nu
     console.error("TAMPERED: flipped a character in the payload ciphertext");
   }
 
+  // A per-request keypair for the *response*: unlike the token/request key
+  // (Auth Service's), this one is ours, so we're the only ones who can
+  // read what comes back. The public half rides along as a plain header —
+  // it grants no authority, it just says "encrypt the answer to this".
+  console.error("Generating a one-off keypair for the response...");
+  const { publicKey: responsePublicKey, privateKey: responsePrivateKey } = await jose.generateKeyPair(
+    "RSA-OAEP-256",
+    { extractable: true }
+  );
+  const responsePublicJwk = await jose.exportJWK(responsePublicKey);
+  const responsePubkeyHeader = Buffer.from(JSON.stringify(responsePublicJwk)).toString("base64url");
+
   console.error(`POSTing encrypted transfer request as ${username}...`);
   const resp = await fetch(`${KONG_INTERNAL_API_URL}/accounts/transfer`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${tokenJwe}`,
-      "Content-Type": "application/jwe"
+      "Content-Type": "application/jwe",
+      "X-Response-Pubkey": responsePubkeyHeader
     },
     body: payloadJwe
   });
 
-  console.log(`\nHTTP ${resp.status}: ${await resp.text()}\n`);
+  const responseBody = await resp.text();
+
+  if (resp.headers.get("content-type")?.includes("application/jwe")) {
+    console.error("Decrypting response with our private key...");
+    const { plaintext } = await jose.compactDecrypt(responseBody, responsePrivateKey);
+    console.log(`\nHTTP ${resp.status}: ${new TextDecoder().decode(plaintext)}\n`);
+  } else {
+    console.log(`\nHTTP ${resp.status}: ${responseBody}\n`);
+  }
 }
 
 async function main() {

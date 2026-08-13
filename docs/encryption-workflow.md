@@ -45,6 +45,42 @@ sequenceDiagram
     Kong-->>Client: JWE(response)<br/>passed through untouched → client decrypts locally, key never left the device
 ```
 
+## Sequence — implemented today
+
+The diagram above is target-state (Vault, per-service keys, Account Service
+encrypting its own response). What's actually running in this repo right now
+is simpler — no Vault, one shared key on the Auth Service side for the
+request, and Kong (not Account Service) encrypting the response using a key
+the client supplies:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Kong
+    participant AuthService as Auth Service
+    participant AccountService as Account Service
+
+    Note over Client,AccountService: 1 · Request arrives
+    Client->>Client: generate one-off response keypair
+    Client->>Kong: Bearer: JWE(token) · Body: JWE(payload)<br/>Header: X-Response-Pubkey (client's public key)
+    Kong->>AuthService: JWE(token) + JWE(payload)<br/>(Auth Service holds the one key used for both)
+
+    Note over AuthService: 2 · Verify identity + decrypt payload
+    AuthService->>AuthService: decrypt(token) with its own private key
+    Note right of AuthService: verified against cached Keycloak JWKS
+    AuthService->>AuthService: decrypt(payload) with the same private key
+    AuthService-->>Kong: claims (roles, scopes) + plaintext payload
+
+    Note over Kong,AccountService: 3 · Access the payload
+    Kong->>AccountService: plaintext payload + trusted headers<br/>(X-User-*)
+    Note right of AccountService: business logic runs here,<br/>no crypto code in this service at all
+
+    Note over Kong,Client: 4 · Respond
+    AccountService-->>Kong: plaintext JSON response
+    Kong->>Kong: encrypt(response, X-Response-Pubkey)<br/>— public-key op, no key of Kong's own needed
+    Kong-->>Client: JWE(response)<br/>client decrypts with the private key it never sent anywhere
+```
+
 ## Reading the diagram
 
 - **Ciphertext hops** (`Client→Kong`, `Kong→AuthService`, `AuthService→Vault`,
@@ -67,14 +103,20 @@ sequenceDiagram
 - **Step 9** is the only step that never touches Vault. Encrypting *for*
   someone only ever needs their public key, not a secret — there's nothing
   for Vault to guard there.
-- **Kong's entire job in this flow** is steps 2 and 6: hand the token to
+- **In this diagram**, Kong's entire job is steps 2 and 6: hand the token to
   Auth Service, forward whatever comes back. It reads claims to set
-  `X-User-*` headers; it never reads a token or a payload.
+  `X-User-*` headers; it never reads a token or a payload. (In what's
+  actually implemented today, Kong also does step 9's response encryption —
+  see the note below — which is a deliberate deviation from this
+  "Kong never decrypts or encrypts anything" framing, made because the
+  operation needs no secret, only a client-supplied public key.)
 
 ## Related
 
-- Token JWE decryption + JWT verification: `auth-service/src/server.ts`
-- Claims caching: `kong/plugins/custom-auth/handler.lua`
+- Token + request payload JWE decryption, JWT verification:
+  `auth-service/src/server.ts`
+- Claims caching, response JWE encryption:
+  `kong/plugins/custom-auth/handler.lua`
 - Architecture and trade-offs for the token half of this flow: [`README.md`](../README.md)
 
 ## What's actually implemented vs. this diagram
@@ -92,21 +134,39 @@ all. Concretely, the differences from the diagram above:
   upstream request body with the plaintext before it reaches Account
   Service. Account Service receives ordinary JSON, no crypto code needed on
   the request side.
-- **Step 9** (`encrypt(response, client's public key)`) is **not
-  implemented at all** — the response is plain JSON. It was tried using
-  Auth Service's key (same as everything else, for consistency with step 7),
-  but that has a real consequence: only Auth Service's private key can
-  decrypt something encrypted with its public key, so the client can't read
-  its own response without an extra round trip back through Auth Service to
-  decrypt it. That round trip was judged not worth it, so response
-  encryption was removed rather than kept in that shape. This diagram's
-  step 9 — encrypt with the *client's* key, not Auth Service's — is still
-  the way to do this without that limitation, if it's revisited.
+- **Step 9** (`encrypt(response, client's public key)`) **is implemented**,
+  but by **Kong**, not Account Service — a deliberate deviation from this
+  diagram. Two earlier attempts were tried and backed out: encrypting with
+  Auth Service's key (only Auth Service could then decrypt it — the client
+  would need a round trip back through Auth Service to read its own
+  response) and encrypting in Account Service with the client's key (works,
+  but puts JWE crypto code in the one service that's supposed to stay
+  crypto-free on both the request *and* response side). Landing it in Kong
+  instead keeps Account Service exactly as thin as the request side already
+  made it: plain JSON in, plain JSON out, no crypto code anywhere in the
+  service. Concretely: `client-simulator` generates a one-off RSA-OAEP
+  keypair per transfer request and sends the public half as a plain
+  `X-Response-Pubkey` header (base64url-encoded JWK) alongside the encrypted
+  request body. It's not sensitive — it grants no authority, it only says
+  "encrypt the answer to this" — so Kong reads it without any trust check.
+  Account Service returns its normal plaintext JSON; Kong's `response` phase
+  (`kong/plugins/custom-auth/handler.lua`) picks up the full buffered body,
+  encrypts it with that key using `resty.openssl` (RSA-OAEP-256 key wrap +
+  A256GCM content encryption, hand-assembled into JWE compact
+  serialization), and returns `application/jwe`. The client decrypts
+  locally with the private half it never sent anywhere. No Vault call
+  needed for this step, same as the diagram notes: encrypting *for* someone
+  is a public-key operation, not a secret one. A config flag
+  (`encrypt_response`, default `true`) lets a route opt out.
 - There is no Vault container in this repo. The governance discussion this
   diagram documents (why private keys shouldn't be loaded into every
   business service) remains the reasoning for *not* giving Account Service
-  a key of its own — the simplified implementation satisfies that by giving
-  it no key at all, rather than by adding Vault.
+  a key of its own on the request side — the simplified implementation
+  satisfies that by giving it no key at all, rather than by adding Vault.
+  The response side goes a step further than the diagram: instead of giving
+  *Account Service* the client's public key, Kong holds it only for the
+  span of one request/response pair, and only ever performs a public-key
+  operation with it — there's no secret material in Kong to protect either.
 
 See the "Test payload encryption" section in [`README.md`](../README.md) for
 how to run it.

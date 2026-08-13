@@ -229,27 +229,41 @@ pair of requests — the second request was served from Kong's shared-memory
 cache without calling the Auth Service. Wait past the TTL and repeat to see
 it call through again.
 
-## Test payload encryption (request)
+## Test payload encryption (request and response)
 
 Beyond the token, `POST /api/accounts/transfer` also encrypts the request
 body — using the *same* Auth Service key already used for the token. Kong
 forwards the encrypted request body to Auth Service alongside the token;
 Auth Service decrypts both and hands Kong back plaintext, which Kong writes
 into the request before it ever reaches Account Service (see
-`docs/encryption-workflow.md` for the full sequence). The response is plain
-JSON — response encryption was tried (Account Service encrypting with Auth
-Service's key too) and pulled back out, since only Auth Service's private
-key could then decrypt it and the client couldn't read its own response
-without an extra round trip.
+`docs/encryption-workflow.md` for the full sequence).
+
+The response is encrypted too, but with a *different* key, and by a
+*different* component: `client-simulator` generates a one-off RSA-OAEP
+keypair per request and sends the public half as a plain `X-Response-Pubkey`
+header (it grants no authority — it just says "encrypt the answer to this" —
+so it needs no trust check). Account Service replies with ordinary
+plaintext JSON, same as `/accounts`; Kong's `custom-auth` plugin picks up
+the full response body in its buffered `response` phase and encrypts it
+with that key (RSA-OAEP-256 + A256GCM, hand-assembled into a compact JWE
+using `resty.openssl` — see `kong/plugins/custom-auth/handler.lua`) before
+it reaches the client. The client decrypts locally with the private half,
+which never left the process. Doing the encryption in Kong rather than
+Account Service keeps Account Service free of crypto code on both the
+request and response side; it also avoids the round trip you'd need if the
+response were encrypted with Auth Service's key instead (only Auth Service
+could then decrypt it). This can be turned off per-route via the plugin's
+`encrypt_response` config (default `true`).
 
 ```bash
 docker compose run --rm client-simulator demo-user transfer 250
 ```
 
 This mints a token, encrypts a demo `{ to, amount }` transfer request with
-Auth Service's public key, and POSTs it to Kong. `demo-user` only has
-`account.read`, so expect a `403`; try `admin-user` (has `account.write`)
-for a `200` with a plaintext confirmation.
+Auth Service's public key, and POSTs it to Kong along with a fresh
+response-decryption public key. `demo-user` only has `account.read`, so
+expect a `403`; try `admin-user` (has `account.write`) for a `200` with the
+decrypted transfer confirmation printed to the console.
 
 Note: this endpoint's request encryption is intentionally excluded from
 Kong's claims cache — a POST body is unique per request, so caching a
@@ -305,18 +319,35 @@ This POC intentionally takes shortcuts for local runnability. For production:
    the existing request timeout.
 10. Add audit logging without logging credentials or raw tokens.
 11. Keep business authorization in the owning microservice.
-12. `/accounts/transfer`'s response is plaintext — response encryption was
-    tried using Auth Service's key and removed, since that key only lets
-    Auth Service (not the client) decrypt the result. See
-    `docs/encryption-workflow.md` for the client-supplied-key design that
-    would let responses be read end-to-end without that limitation.
+12. `/accounts/transfer`'s response encryption key is a keypair generated
+    fresh, in-memory, per CLI run — real clients need a way to persist and
+    reuse (or re-derive) their own keypair, and the server-side header that
+    carries the public key (`X-Response-Pubkey`) should be size-bounded and
+    validated before being trusted as a JWK.
+13. Kong's response encryption fails open: if `X-Response-Pubkey` is
+    malformed or encryption errors out, the plugin logs a warning and
+    returns the response as plaintext rather than blocking it. That's
+    convenient for a demo but means a client that *believes* it asked for
+    an encrypted response has no guarantee it got one — a production setup
+    should either fail closed (reject the request) or give the client an
+    explicit signal (e.g. a response header) confirming encryption
+    happened.
 
 ## Main architectural decision
 
-Kong is the API security enforcement point and a dumb JWE pass-through — it
-never decrypts.
+Kong is the API security enforcement point. On the request side it's a
+dumb JWE pass-through — it never decrypts the token or the request body.
+On the response side, for routes that opt in, it performs one exception to
+that rule: encrypting the plaintext response with a client-supplied public
+key. That's a deliberate asymmetry, not an oversight — encrypting *for*
+someone is a public-key operation that needs no secret of Kong's own, so it
+doesn't reopen the "Kong holds no key material" property that motivates
+keeping decryption out of Kong.
 
-The Custom Authentication Service owns authentication: JWE decryption,
-local JWT/JWKS verification, and optional Keycloak introspection.
+The Custom Authentication Service owns authentication: JWE decryption
+(token and request payload), local JWT/JWKS verification, and optional
+Keycloak introspection.
 
-The microservice owns resource/business authorization.
+The microservice owns resource/business authorization, and stays free of
+crypto code entirely — both request decryption and response encryption
+happen outside it.

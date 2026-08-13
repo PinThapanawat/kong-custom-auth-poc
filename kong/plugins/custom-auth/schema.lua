@@ -33,6 +33,12 @@ return {
               default = 60,
               between = { 1, 3600 }
             }
+          },
+          {
+            encrypt_response = {
+              type = "boolean",
+              default = true
+            }
           }
         }
       }
