@@ -63,10 +63,11 @@ sequenceDiagram
     Note over Client,AccountService: 1 · Request arrives
     Client->>Client: generate one-off response keypair
     Client->>Kong: Bearer: JWE(token) · Body: JWE(payload)<br/>Header: X-Response-Pubkey (client's public key)
-    Kong->>AuthService: JWE(token) + JWE(payload)<br/>(Auth Service holds the one key used for both)
+    Kong->>AuthService: [PDS private Key??]JWE(token) + [PDS private Key]JWE(payload)<br/>(Auth Service holds the one key used for both)
 
     Note over AuthService: 2 · Verify identity + decrypt payload
-    AuthService->>AuthService: decrypt(token) with its own private key
+    AuthService->>AuthService: decrypt(token) with its Sesstion encrpyt key
+    AuthService->>AuthService: validate signing sessionJWT 
     Note right of AuthService: verified against cached Keycloak JWKS
     AuthService->>AuthService: decrypt(payload) with the same private key
     AuthService-->>Kong: claims (roles, scopes) + plaintext payload
@@ -77,7 +78,8 @@ sequenceDiagram
 
     Note over Kong,Client: 4 · Respond
     AccountService-->>Kong: plaintext JSON response
-    Kong->>Kong: encrypt(response, X-Response-Pubkey)<br/>— public-key op, no key of Kong's own needed
+    Kong->>AuthService: encrypt response 
+    AuthService-->>Kong: encrypted response 
     Kong-->>Client: JWE(response)<br/>client decrypts with the private key it never sent anywhere
 ```
 
