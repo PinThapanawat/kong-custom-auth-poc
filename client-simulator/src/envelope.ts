@@ -6,8 +6,8 @@ import * as crypto from "node:crypto";
 // (response is the reverse: JWE decrypt first, then parse this envelope).
 //
 // This client primarily encodes requests it sends and decodes responses it
-// receives. `auth-service/src/pds/envelope.ts` is the mirror image (PDS
-// side). Both directions are implemented in each file (not just the
+// receives. `Cryptography-Service/src/pds/envelope.ts` is the mirror image
+// (PDS side). Both directions are implemented in each file (not just the
 // "primary" one) so each side can be unit-tested with self-contained
 // round-trip tests, without a shared package — this repo has no monorepo
 // tooling and each service builds independently.

@@ -9,12 +9,17 @@ spec" below for what's still simplified relative to the PDF.
 
 The PDS's job: every request/response body between the mobile client and the
 backend BFF APIs is wrapped in a signed binary envelope, then JWE-encrypted.
-All decrypt/verify/re-encrypt logic (and every key) lives in `auth-service`
-(the PDS) — Kong never holds a SEK or a PDS key. Kong's role differs by
-category:
+All decrypt/verify/re-encrypt logic (and every key) lives in `Cryptography-Service`
+(the PDS) — Kong never holds a SEK or a PDS key. `Cryptography-Service` in
+turn never talks to Keycloak directly: all ROPC login, access-token
+verification, and refresh-token introspection is delegated to a separate
+`auth-service` over two internal, `X-Auth-Caller`-gated endpoints
+(`/internal/login`, `/internal/introspect`) — `Cryptography-Service` holds
+every crypto key, `auth-service` holds no keys and just brokers Keycloak
+calls. Kong's role differs by category:
 
 - **Category 1** (device enrollment, session acquiring) and the PDS JWKS
-  endpoint: pure pass-through. Kong routes the request to `auth-service` and
+  endpoint: pure pass-through. Kong routes the request to `Cryptography-Service` and
   relays whatever comes back, no crypto logic of its own.
 - **Category 2/3** (`/pds/bff/*`): Kong's `custom-auth` plugin
   (`kong/plugins/custom-auth/handler.lua`) actively brokers the request — it
@@ -35,7 +40,8 @@ forwarding instead once the PDS has vouched for the request).
 sequenceDiagram
     participant Device as Mobile Device
     participant Kong
-    participant PDS as auth-service (PDS)
+    participant PDS as Cryptography-Service (PDL)
+    participant Auth as auth-service
     participant Keycloak
 
     Note over Device,PDS: One-time: device enrollment
@@ -49,8 +55,11 @@ sequenceDiagram
     Device->>Kong: POST /pds/session<br/>Authorization: Bearer deviceJwt
     Kong->>PDS: (routed)
     PDS->>PDS: verify deviceJwt, decrypt JWE,<br/>verify envelope signature
-    PDS->>Keycloak: ROPC login (grant_type=password)
-    Keycloak-->>PDS: access_token + refresh_token
+    PDS->>Auth: POST /internal/login {username, password}<br/>X-Auth-Caller: cryptography-service
+    Auth->>Keycloak: ROPC login (grant_type=password)
+    Keycloak-->>Auth: access_token + refresh_token
+    Auth->>Auth: verify access_token against Keycloak JWKS
+    Auth-->>PDS: {sub, roles, scopes, refreshToken}
     PDS->>PDS: generate sessionId + 32-byte SEK<br/>store SEK + AES-256-GCM-encrypted refresh_token<br/>(Postgres primary, Redis 4h cache)<br/>issue sessionJwt (ES256, 4h)
     PDS->>PDS: build 0x01 response envelope (embeds SEK)<br/>sign with PDS private key<br/>JWE-encrypt to device's public key
     PDS-->>Device: encrypted, signed response
@@ -71,7 +80,7 @@ phase for the route's nominal upstream never actually fires).
 sequenceDiagram
     participant Device as Mobile Device
     participant Kong as Kong (custom-auth plugin)
-    participant PDS as auth-service (PDS)
+    participant PDS as Cryptography-Service (PDL)
     participant Account as account-service
 
     Device->>Device: build signed envelope {request body}<br/>sign with device private key
@@ -113,8 +122,9 @@ lifetime — the PDS never checks back with Keycloak on ordinary Category 2/3
 requests. A client can opt a single request into a live check by sending
 `X-Require-Revocation-Check: true`; Kong forwards that as
 `requireRevocationCheck` on its existing `/pds/internal/verify` call, no
-extra round trip between Kong and the PDS. The PDS then introspects the
-Keycloak **refresh token** captured at login (RFC 7662), not the access
+extra round trip between Kong and the PDS. The PDS then asks `auth-service`
+to introspect the Keycloak **refresh token** captured at login (RFC 7662),
+not the access
 token — Keycloak's `accessTokenLifespan` here is 120 seconds, far shorter
 than the 4h session this check protects, so the access token would read
 "inactive" almost immediately for reasons unrelated to revocation. A
@@ -125,7 +135,8 @@ introspecting the refresh token still reflects live revocation state.
 sequenceDiagram
     participant Device as Mobile Device
     participant Kong as Kong (custom-auth plugin)
-    participant PDS as auth-service (PDS)
+    participant PDS as Cryptography-Service (PDL)
+    participant Auth as auth-service
     participant Keycloak
     participant Account as account-service
 
@@ -136,8 +147,10 @@ sequenceDiagram
         PDS->>PDS: reuse cached active/inactive verdict
     else cache miss/expired
         PDS->>PDS: decrypt stored refresh_token (AES-256-GCM, KEK from Vault)
-        PDS->>Keycloak: POST /realms/poc/protocol/openid-connect/token/introspect<br/>token=refresh_token, client=poc-introspection (confidential)
-        Keycloak-->>PDS: {active: true|false}
+        PDS->>Auth: POST /internal/introspect {refreshToken}<br/>X-Auth-Caller: cryptography-service
+        Auth->>Keycloak: POST /realms/poc/protocol/openid-connect/token/introspect<br/>token=refresh_token, client=poc-introspection (confidential)
+        Keycloak-->>Auth: {active: true|false}
+        Auth-->>PDS: {active: true|false}
         PDS->>PDS: cache verdict for 30s (keyed by sessionId)
     end
     alt inactive (revoked/logged out)
@@ -179,7 +192,7 @@ up a second PDS instance.
 
 Every request/response payload is wrapped in this binary envelope *before*
 JWE encryption (request) / *after* JWE decryption (response). Implemented in
-`auth-service/src/pds/envelope.ts` and mirrored in
+`Cryptography-Service/src/pds/envelope.ts` and mirrored in
 `client-simulator/src/envelope.ts`.
 
 **Signed request envelope:**
@@ -233,7 +246,12 @@ Acquiring Response V1", Category 1 only) — same as above with a 32-byte
 | Device keypair (EC P-256) | Client, once, persisted locally | Client only (private half never leaves the device) | Signs every request envelope; also the `ECDH-ES+A256KW` target for the Category 1 response (see deviation below) |
 | SEK (AES-256) | PDS, per session | Postgres (AESWrap-wrapped) + Redis (4h cache); device via the Category 1 response | `dir`+`A256GCM` content key for all Category 2/3 request/response bodies |
 | SEK-wrap KEK (AES-256) | PDS startup, once (persisted in Vault) | Vault (`secret/data/pds/sek-wrap-kek`) | RFC 3394 AESWrap key-encryption-key protecting SEKs at rest in Postgres; also encrypts the refresh token below (`tokenCrypto.ts`) |
-| Keycloak refresh token | Keycloak, per login (ROPC) | Postgres (AES-256-GCM-encrypted) + Redis (4h cache); never sent to the device | Introspected (RFC 7662) for the opt-in `X-Require-Revocation-Check` on Category 2/3 |
+| Keycloak refresh token | Keycloak, per login (ROPC), fetched via `auth-service` | Postgres (AES-256-GCM-encrypted) + Redis (4h cache), inside `Cryptography-Service`; never sent to the device or held by `auth-service` | Introspected (RFC 7662) for the opt-in `X-Require-Revocation-Check` on Category 2/3 |
+
+`auth-service` itself holds no key material — it only brokers Keycloak ROPC
+login and RFC 7662 introspection for `Cryptography-Service` over two
+internal endpoints (`POST /internal/login`, `POST /internal/introspect`,
+both gated by `X-Auth-Caller: cryptography-service`).
 
 ## Deviations from the spec
 
@@ -257,10 +275,10 @@ Acquiring Response V1", Category 1 only) — same as above with a 32-byte
   child tables is real operational weight for a POC-scale table. This repo
   uses a single table with a btree index on `expiration_bucket`
   (`postgres/init/001-session-encryption-key.sql`) and an hourly `DELETE`
-  (`auth-service/src/pds/cleanupJob.ts`) instead.
+  (`Cryptography-Service/src/pds/cleanupJob.ts`) instead.
 - **Category 3 is a config flag, not a separate deployment.** `PDS_SEK_SOURCE=http`
   swaps the SEK lookup's DB path for an HTTP call, but both code paths run
-  in the same `auth-service` container — there's no second PDS instance
+  in the same `Cryptography-Service` container — there's no second PDS instance
   simulating a MiniApp's isolated environment.
 - **Multipart/form-data payload encryption is not implemented.** The PDF
   (pp.6-7) specs per-file AES-256-GCM encryption plus a `metaData` JWE part
@@ -297,17 +315,19 @@ Acquiring Response V1", Category 1 only) — same as above with a 32-byte
 
 ## Related
 
-- Binary envelope codec: `auth-service/src/pds/envelope.ts`,
+- Binary envelope codec: `Cryptography-Service/src/pds/envelope.ts`,
   `client-simulator/src/envelope.ts` (intentionally duplicated — no
   monorepo tooling in this repo, and the two sides are asymmetric: PDS
   mostly decodes requests and encodes responses, the client is the mirror).
-- RFC 3394 AESWrap: `auth-service/src/pds/aesWrap.ts`.
-- Vault key provisioning: `auth-service/src/pds/vaultClient.ts`.
-- SEK storage (Redis cache-aside over Postgres): `auth-service/src/pds/sekStore.ts`.
-- Refresh token encryption for revocation checks: `auth-service/src/pds/tokenCrypto.ts`.
-- Hourly SEK cleanup: `auth-service/src/pds/cleanupJob.ts`.
+- RFC 3394 AESWrap: `Cryptography-Service/src/pds/aesWrap.ts`.
+- Vault key provisioning: `Cryptography-Service/src/pds/vaultClient.ts`.
+- SEK storage (Redis cache-aside over Postgres): `Cryptography-Service/src/pds/sekStore.ts`.
+- Refresh token encryption for revocation checks: `Cryptography-Service/src/pds/tokenCrypto.ts`.
+- Hourly SEK cleanup: `Cryptography-Service/src/pds/cleanupJob.ts`.
 - All PDS HTTP routes (device enrollment, session acquiring, the internal
-  verify/encrypt-response endpoints Kong calls): `auth-service/src/server.ts`.
+  verify/encrypt-response endpoints Kong calls): `Cryptography-Service/src/server.ts`.
+- Keycloak login and introspection, on behalf of `Cryptography-Service`:
+  `auth-service/src/server.ts`.
 - Client-side session/device flow: `client-simulator/src/pdsClient.ts`.
 - Kong routing: `kong/kong.yml`. Category 2/3 auth-check-and-forward logic:
   `kong/plugins/custom-auth/handler.lua` (+ `schema.lua` for its config

@@ -16,29 +16,14 @@ import { API_IDS, apiIdForBffRequest } from "./pds/apiRegistry";
 const app = express();
 const port = Number(process.env.PORT ?? 8080);
 
-const KEYCLOAK_ISSUER = process.env.KEYCLOAK_ISSUER ?? "";
-const KEYCLOAK_JWKS_URL = process.env.KEYCLOAK_JWKS_URL ?? "";
-const KEYCLOAK_TOKEN_URL = process.env.KEYCLOAK_TOKEN_URL ?? "";
 const KEYCLOAK_CLIENT_ID = process.env.KEYCLOAK_CLIENT_ID ?? "poc-client";
 const PDS_SEK_SOURCE = process.env.PDS_SEK_SOURCE === "http" ? "http" : "db";
-const PDS_SEK_INQUIRY_URL = process.env.PDS_SEK_INQUIRY_URL ?? "http://auth-service:8080/pds/internal/sek-inquiry";
+const PDS_SEK_INQUIRY_URL = process.env.PDS_SEK_INQUIRY_URL ?? "http://cryptography-service:8080/pds/internal/sek-inquiry";
 
-// Category 2/3's opt-in X-Require-Revocation-Check (see /pds/internal/verify
-// below) introspects the Keycloak refresh token captured at Category 1
-// login. Introspection requires a confidential client (Keycloak rejects
-// introspection calls from the public poc-client used for login), so a
-// separate introspection-only client/secret is used here.
-const KEYCLOAK_INTROSPECT_URL = process.env.KEYCLOAK_INTROSPECT_URL ?? "";
-const KEYCLOAK_INTROSPECTION_CLIENT_ID = process.env.KEYCLOAK_INTROSPECTION_CLIENT_ID ?? "poc-introspection";
-const KEYCLOAK_INTROSPECTION_CLIENT_SECRET = process.env.KEYCLOAK_INTROSPECTION_CLIENT_SECRET;
-
-const JWKS = jose.createRemoteJWKSet(new URL(KEYCLOAK_JWKS_URL), {
-  cooldownDuration: 30_000,
-  cacheMaxAge: 600_000
-});
-
-const KNOWN_ROLES = new Set(["customer", "admin"]);
-const KNOWN_SCOPES = new Set(["account.read", "account.write"]);
+// All Keycloak interaction (ROPC login, access-token verification, refresh-
+// token introspection) lives in the separate auth-service — this service
+// only holds crypto/key material. See docs/encryption-workflow.md.
+const AUTH_SERVICE_URL = process.env.AUTH_SERVICE_URL ?? "http://auth-service:8080";
 
 // Loaded once at startup from Vault — see initPds() below.
 let pdsEncKeyPair: EcKeyPair;
@@ -68,20 +53,15 @@ async function checkRevocation(sessionId: string, refreshToken: string): Promise
 
   let active = false;
   try {
-    const resp = await fetch(KEYCLOAK_INTROSPECT_URL, {
+    const resp = await fetch(`${AUTH_SERVICE_URL}/internal/introspect`, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        token: refreshToken,
-        token_type_hint: "refresh_token",
-        client_id: KEYCLOAK_INTROSPECTION_CLIENT_ID,
-        ...(KEYCLOAK_INTROSPECTION_CLIENT_SECRET ? { client_secret: KEYCLOAK_INTROSPECTION_CLIENT_SECRET } : {})
-      })
+      headers: { "Content-Type": "application/json", "X-Auth-Caller": "cryptography-service" },
+      body: JSON.stringify({ refreshToken })
     });
     const json = (await resp.json()) as { active?: boolean };
     active = json.active === true;
   } catch (err) {
-    console.error(`Keycloak introspection call failed for session ${sessionId}:`, (err as Error).message);
+    console.error(`auth-service introspection call failed for session ${sessionId}:`, (err as Error).message);
     active = false; // fail closed — can't confirm the session is still valid
   }
 
@@ -198,46 +178,32 @@ app.post("/pds/session", express.text({ type: "application/jose", limit: "1mb" }
     return res.status(400).json({ authenticated: false, message: "invalid session-acquiring payload" });
   }
 
-  let accessToken: string;
-  let refreshToken: string | undefined;
-  try {
-    const tokenResp = await fetch(KEYCLOAK_TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "password",
-        client_id: KEYCLOAK_CLIENT_ID,
-        username: credentials.username ?? "",
-        password: credentials.password ?? ""
-      })
-    });
-    if (!tokenResp.ok) {
-      return res.status(401).json({ authenticated: false, message: "invalid credentials" });
-    }
-    const tokenJson = (await tokenResp.json()) as { access_token?: string; refresh_token?: string };
-    if (!tokenJson.access_token) {
-      return res.status(401).json({ authenticated: false, message: "invalid credentials" });
-    }
-    accessToken = tokenJson.access_token;
-    refreshToken = tokenJson.refresh_token;
-  } catch (err) {
-    console.error("Keycloak ROPC login failed:", (err as Error).message);
-    return res.status(401).json({ authenticated: false, message: "authentication failed" });
-  }
-
   let sub: string;
   let roles: string[];
   let scopes: string[];
+  let refreshToken: string | undefined;
   try {
-    const { payload } = await jose.jwtVerify(accessToken, JWKS, { issuer: KEYCLOAK_ISSUER });
-    const realmRoles = Array.isArray((payload as any).realm_access?.roles)
-      ? ((payload as any).realm_access.roles as string[])
-      : [];
-    sub = String(payload.sub ?? "");
-    roles = realmRoles.filter((r) => KNOWN_ROLES.has(r));
-    scopes = realmRoles.filter((r) => KNOWN_SCOPES.has(r));
+    const loginResp = await fetch(`${AUTH_SERVICE_URL}/internal/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Auth-Caller": "cryptography-service" },
+      body: JSON.stringify({ username: credentials.username, password: credentials.password })
+    });
+    if (!loginResp.ok) {
+      const errJson = (await loginResp.json().catch(() => ({}))) as { error?: string };
+      return res.status(401).json({ authenticated: false, message: errJson.error ?? "authentication failed" });
+    }
+    const loginJson = (await loginResp.json()) as {
+      sub?: string;
+      roles?: string[];
+      scopes?: string[];
+      refreshToken?: string;
+    };
+    sub = loginJson.sub ?? "";
+    roles = loginJson.roles ?? [];
+    scopes = loginJson.scopes ?? [];
+    refreshToken = loginJson.refreshToken;
   } catch (err) {
-    console.error("Keycloak access token verification failed:", (err as Error).message);
+    console.error("auth-service login call failed:", (err as Error).message);
     return res.status(401).json({ authenticated: false, message: "authentication failed" });
   }
 

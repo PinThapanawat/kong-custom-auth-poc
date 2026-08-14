@@ -91,6 +91,8 @@ services:
     depends_on:
       auth-service:
         condition: service_healthy
+      cryptography-service:
+        condition: service_healthy
       account-service:
         condition: service_healthy
     restart: unless-stopped
@@ -108,17 +110,37 @@ services:
       KEYCLOAK_INTROSPECT_URL: "http://keycloak:8080/realms/poc/protocol/openid-connect/token/introspect"
       KEYCLOAK_INTROSPECTION_CLIENT_ID: "poc-introspection"
       KEYCLOAK_INTROSPECTION_CLIENT_SECRET: "introspection-secret"
+    expose:
+      - "8080"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  cryptography-service:
+    build:
+      context: ./Cryptography-Service
+    container_name: cryptography-service
+    environment:
+      PORT: "8080"
+      KEYCLOAK_CLIENT_ID: "poc-client"
+      AUTH_SERVICE_URL: "http://auth-service:8080"
       VAULT_ADDR: "http://vault:8200"
       VAULT_TOKEN: "root-poc-token"
       DATABASE_URL: "postgres://pds:pds-poc-password@postgres:5432/pds"
       REDIS_URL: "redis://redis:6379"
       PDS_ENV: "poc"
       PDS_SEK_SOURCE: "db"
-      PDS_SEK_INQUIRY_URL: "http://auth-service:8080/pds/internal/sek-inquiry"
+      PDS_SEK_INQUIRY_URL: "http://cryptography-service:8080/pds/internal/sek-inquiry"
     expose:
       - "8080"
     depends_on:
-      keycloak:
+      auth-service:
         condition: service_healthy
       vault:
         condition: service_healthy

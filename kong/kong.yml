@@ -1,8 +1,8 @@
 _format_version: "3.0"
 
 # Category 1 (device enrollment, session acquiring) and the PDS JWKS
-# endpoint are still a thin pass-through straight to auth-service — no
-# crypto logic in Kong for those.
+# endpoint are still a thin pass-through straight to cryptography-service —
+# no crypto logic in Kong for those.
 #
 # Category 2/3 BFF traffic (/pds/bff/*) is different: the custom-auth
 # plugin (kong/plugins/custom-auth/handler.lua) checks with the PDS that
@@ -15,7 +15,7 @@ _format_version: "3.0"
 
 services:
   - name: pds-service
-    url: http://auth-service:8080
+    url: http://cryptography-service:8080
 
     routes:
       - name: pds-jwks
@@ -70,7 +70,7 @@ services:
 
       - name: custom-auth
         config:
-          pds_verify_url: http://auth-service:8080/pds/internal/verify
-          pds_encrypt_response_url: http://auth-service:8080/pds/internal/encrypt-response
+          pds_verify_url: http://cryptography-service:8080/pds/internal/verify
+          pds_encrypt_response_url: http://cryptography-service:8080/pds/internal/encrypt-response
           account_service_url: http://account-service:8080
           timeout_ms: 5000

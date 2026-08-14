@@ -4,7 +4,7 @@ import NodeVault from "node-vault";
 // Startup key material provisioning against HashiCorp Vault (dev mode).
 // Replaces the old `initKeys()` (regenerated an ephemeral RSA keypair on
 // every process restart) with a read-or-generate-and-persist pattern: keys
-// now survive `auth-service` restarts as long as the Vault dev container
+// now survive `Cryptography-Service` restarts as long as the Vault dev container
 // itself stays up. Vault dev mode is in-memory and loses everything on its
 // *own* restart — that caveat just moves one layer down, it isn't solved by
 // this change, and is documented as a POC simplification (production Vault

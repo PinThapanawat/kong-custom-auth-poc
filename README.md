@@ -8,7 +8,7 @@ identity provider, Vault holding the PDS's key material, and Postgres/Redis
 backing per-session encryption keys.
 
 ```text
-Client -> Kong -> auth-service (the PDS) [-> Keycloak | -> account-service]
+Client -> Kong -> Cryptography-Service (the PDS) [-> auth-service -> Keycloak | -> account-service]
 ```
 
 ## Architecture
@@ -16,11 +16,12 @@ Client -> Kong -> auth-service (the PDS) [-> Keycloak | -> account-service]
 ```text
 Category 1 (device enrollment, session acquiring) — thin pass-through:
 
-  Device --JWE(signed envelope)--> Kong --(routed, no crypto)--> auth-service (PDS)
+  Device --JWE(signed envelope)--> Kong --(routed, no crypto)--> Cryptography-Service (PDS)
                                                                        |
                                                      verify deviceJwt, decrypt JWE,
                                                      verify envelope signature,
-                                                     Keycloak ROPC login,
+                                                     POST auth-service /internal/login
+                                                       (Keycloak ROPC login, done there),
                                                      issue sessionJwt + SEK,
                                                      store in Postgres (primary) /
                                                      Redis (4h cache)
@@ -32,15 +33,17 @@ Category 2/3 (/pds/bff/*) — Kong's custom-auth plugin brokers the call:
 
   Device --JWE(signed envelope)--> Kong (custom-auth plugin)
                                         |
-                                        | 1. POST /pds/internal/verify -----> auth-service (PDS)
+                                        | 1. POST /pds/internal/verify -----> Cryptography-Service (PDS)
                                         |                                     decrypt, verify sessionJwt +
                                         |                                     SEK + envelope signature
+                                        |                                     (opt-in: POST auth-service
+                                        |                                      /internal/introspect)
                                         | <---- outcome + plaintext + X-User-* headers
                                         |
                                         | 2. plaintext request -------------> account-service
                                         | <---- plaintext response            (zero crypto code)
                                         |
-                                        | 3. POST /pds/internal/encrypt-response -> auth-service (PDS)
+                                        | 3. POST /pds/internal/encrypt-response -> Cryptography-Service (PDS)
                                         | <---- encrypted, signed reply
                                         v
                                      Device
@@ -57,13 +60,21 @@ hop to `account-service` in between two PDS round trips. `account-service`
 only ever sees plaintext and trusted `X-User-*` headers — no crypto code on
 either side of it.
 
+`Cryptography-Service` (the PDS) never talks to Keycloak itself — it
+delegates ROPC login and refresh-token introspection to a separate,
+keyless `auth-service` over two internal endpoints
+(`POST /internal/login`, `POST /internal/introspect`), gated by
+`X-Auth-Caller: cryptography-service`. `Cryptography-Service` is the only
+service that ever holds crypto key material (Vault keys, the SEK-wrap KEK,
+per-session SEKs); `auth-service` holds none.
+
 There are three request categories in the spec:
 
 - **Category 1 — Session Acquiring** (`POST /pds/session`): request is
-  `ECDH-ES+A256KW`/`A256GCM`-encrypted to the PDS's public key; the PDS logs
-  the user into Keycloak (ROPC), mints a session + a 32-byte Session
-  Encryption Key (SEK), and returns both — encrypted to the *device's*
-  public key.
+  `ECDH-ES+A256KW`/`A256GCM`-encrypted to the PDS's public key; the PDS asks
+  `auth-service` to log the user into Keycloak (ROPC), then mints a session +
+  a 32-byte Session Encryption Key (SEK) and returns both — encrypted to the
+  *device's* public key.
 - **Category 2 — other BFF API** (`ALL /pds/bff/*`): request/response are
   `dir`/`A256GCM`-encrypted directly with the SEK from Category 1.
 - **Category 3 — MiniApp BFF API**: same as Category 2, with the SEK sourced
@@ -92,8 +103,8 @@ Category 1 → Category 2 flow.
 docker compose up --build
 ```
 
-This brings up Keycloak, Vault, Postgres, Redis, Kong, `auth-service` (the
-PDS), and `account-service`. `client-simulator` is not started automatically
+This brings up Keycloak, Vault, Postgres, Redis, Kong, `auth-service`,
+`Cryptography-Service` (the PDS), and `account-service`. `client-simulator` is not started automatically
 (it's a one-shot CLI — see below). Wait for everything to report healthy:
 
 ```bash
@@ -109,7 +120,7 @@ Vault and Postgres are usually faster.
 # One-time: generate a device keypair and enroll it with the PDS
 docker compose run --rm client-simulator enroll
 
-# Category 1: log in (Keycloak ROPC inside the PDS), acquire a session + SEK
+# Category 1: log in (PDS delegates Keycloak ROPC to auth-service), acquire a session + SEK
 docker compose run --rm client-simulator login demo-user
 
 # Category 2: GET /accounts through the PDS (needs account.read)
@@ -145,8 +156,8 @@ ever reaches `account-service`.
   expect `HTTP 401`, returned as **plaintext** JSON (no SEK is trusted yet
   at that point, so there's nothing to encrypt the error with).
 - **Redis down**: `docker stop redis`, then re-run `accounts` — it should
-  still succeed via the Postgres fallback (`auth-service` logs a warning,
-  not an error).
+  still succeed via the Postgres fallback (`Cryptography-Service` logs a
+  warning, not an error).
 - **Postgres down, cold Redis cache**: stop both `redis` and `postgres`,
   then run `accounts` for a session that was never cached — expect
   `HTTP 500` plaintext (`{"error":"session store unavailable"}`).
@@ -158,9 +169,10 @@ ever reaches `account-service`.
 Category 2 normally trusts the `sessionJwt` for its full 4-hour lifetime.
 Passing `--revocation-check` makes `client-simulator` send
 `X-Require-Revocation-Check: true`, which makes Kong's `custom-auth` plugin
-ask `auth-service` to introspect the Keycloak refresh token captured at
-login (RFC 7662, via the confidential `poc-introspection` client) before
-trusting the session for that one request.
+ask `Cryptography-Service` to introspect the Keycloak refresh token captured
+at login — `Cryptography-Service` in turn asks `auth-service`, which does
+the actual RFC 7662 call (via the confidential `poc-introspection` client)
+before trusting the session for that one request.
 
 ```bash
 docker compose run --rm client-simulator login demo-user
@@ -244,9 +256,9 @@ This POC intentionally takes shortcuts for local runnability. For production:
    implemented; `/pds/bff/*` returns `501` for that content type.
 8. Postgres is a single table with a `DELETE`-based hourly cleanup, not the
    spec's SQL-Server memory-optimized, physically partitioned table.
-9. Keep TLS/mTLS between Kong, `auth-service`, `account-service`, Vault,
-   Postgres, and Redis — this POC runs them all in plaintext on a local
-   Docker network.
+9. Keep TLS/mTLS between Kong, `Cryptography-Service`, `auth-service`,
+   `account-service`, Vault, Postgres, and Redis — this POC runs them all in
+   plaintext on a local Docker network.
 10. Do not trust client-supplied identity headers — Kong's `custom-auth`
     plugin builds the `account-service` request from scratch (method, path,
     and a fresh headers table populated only from the PDS's verify
@@ -270,15 +282,19 @@ This POC intentionally takes shortcuts for local runnability. For production:
 
 ## Main architectural decision
 
-The PDS (`auth-service`) is the only place that ever touches key material —
-Vault-held keys, the SEK-wrap KEK, per-session SEKs — end to end. Kong holds
-no keys and never encrypts or decrypts on its own; for Category 1 it's a
-pure pass-through, and for Category 2/3 its `custom-auth` plugin actively
-checks with the PDS that auth is complete before forwarding to
+The PDS (`Cryptography-Service`) is the only place that ever touches key
+material — Vault-held keys, the SEK-wrap KEK, per-session SEKs — end to end.
+Kong holds no keys and never encrypts or decrypts on its own; for Category 1
+it's a pure pass-through, and for Category 2/3 its `custom-auth` plugin
+actively checks with the PDS that auth is complete before forwarding to
 `account-service` itself, then hands the reply back to the PDS to encrypt.
 `account-service` sits behind Kong and stays completely free of crypto code,
 on both the request and response side, trusting only the headers the plugin
-sets after the PDS has verified a session.
+sets after the PDS has verified a session. `auth-service` is a second,
+keyless service that only brokers Keycloak calls (ROPC login, refresh-token
+introspection) for `Cryptography-Service` — splitting "owns crypto key
+material" from "talks to the identity provider" into two services with
+distinct trust boundaries.
 
 See `docs/encryption-workflow.md` for the full request/response sequence
 diagrams, the binary envelope byte layout, the key-material inventory, and

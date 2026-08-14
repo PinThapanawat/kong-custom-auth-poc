@@ -3,7 +3,7 @@ local cjson = require "cjson.safe"
 
 -- Category 2/3 BFF traffic (PDF pp.4-5), brokered by Kong instead of the
 -- PDS calling account-service itself: this plugin calls the PDS
--- (auth-service) to check auth is complete and get back plaintext + trusted
+-- (cryptography-service) to check auth is complete and get back plaintext + trusted
 -- headers, forwards the now-plaintext request to account-service itself,
 -- then calls the PDS a second time to re-encrypt the reply before it goes
 -- back to the client. The SEK never leaves the PDS/Vault boundary — Kong
