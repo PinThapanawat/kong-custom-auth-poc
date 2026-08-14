@@ -88,7 +88,7 @@ sequenceDiagram
     Device->>Kong: request /pds/bff/...<br/>Authorization: Bearer sessionJwt
 
     Kong->>PDS: POST /pds/internal/verify<br/>{sessionJwt, jwe, method, upstreamPath, requestUniqueId}
-    PDS->>PDS: verify sessionJwt (401 plaintext on failure)
+    PDS->>PDS: check signing sessionJwt and check expiry  (401 plaintext on failure)
     PDS->>PDS: look up SEK: Redis, fallback to Postgres<br/>(401 not-found / 500 db-error, both plaintext)
     PDS->>PDS: decrypt payload with SEK (400 encrypted on failure)
     PDS->>PDS: verify envelope signature vs stored device pubkey<br/>(400 encrypted on failure)
@@ -145,13 +145,12 @@ sequenceDiagram
     PDS->>PDS: verify sessionJwt, look up SEK<br/>(as in the normal Category 2 flow)
     alt cached result < 30s old
         PDS->>PDS: reuse cached active/inactive verdict
+        PDS-->>Kong: outcome: authenticated | unauthenticated | rejected<br/>(+ plaintext body, sessionId, X-User-* fields, when authenticated)
     else cache miss/expired
-        PDS->>PDS: decrypt stored refresh_token (AES-256-GCM, KEK from Vault)
-        PDS->>Auth: POST /internal/introspect {refreshToken}<br/>X-Auth-Caller: cryptography-service
+        Kong->>Auth: POST /internal/introspect {refreshToken}<br/>X-Auth-Caller: Kong
         Auth->>Keycloak: POST /realms/poc/protocol/openid-connect/token/introspect<br/>token=refresh_token, client=poc-introspection (confidential)
         Keycloak-->>Auth: {active: true|false}
-        Auth-->>PDS: {active: true|false}
-        PDS->>PDS: cache verdict for 30s (keyed by sessionId)
+        Auth-->>Kong: outcome: authenticated | unauthenticated 
     end
     alt inactive (revoked/logged out)
         PDS-->>Kong: outcome: rejected, 401, encrypted {"error":"session revoked"}
