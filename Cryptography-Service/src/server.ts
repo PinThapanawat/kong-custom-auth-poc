@@ -29,13 +29,6 @@ const AUTH_SERVICE_URL = process.env.AUTH_SERVICE_URL ?? "http://auth-service:80
 let pdsEncKeyPair: EcKeyPair;
 let pdsSignKeyPair: EcKeyPair;
 
-// Cached by sessionId (not by token jti, unlike the introspection cache this
-// repo used to have on its old access-token-per-request model) since that's
-// the identifier /pds/internal/verify already has on hand — one Keycloak
-// round trip amortized across a burst of requests on the same session.
-const introspectionCache = new Map<string, { active: boolean; expiresAt: number }>();
-const INTROSPECTION_TTL_MS = 60 * 60 * 1000; // 1 hour
-
 /**
  * RFC 7662 token introspection against Keycloak, run against the refresh
  * token captured at Category 1 login (not the access token — Keycloak's
@@ -43,15 +36,11 @@ const INTROSPECTION_TTL_MS = 60 * 60 * 1000; // 1 hour
  * check protects, so it would report "inactive" almost immediately for
  * reasons unrelated to revocation). A revoked/logged-out Keycloak session
  * invalidates its refresh tokens too, so this still reflects live
- * revocation state.
+ * revocation state. Every call hits Keycloak — no caching, since this
+ * check only runs when the client explicitly opts in via
+ * X-Require-Revocation-Check.
  */
 async function checkRevocation(sessionId: string, refreshToken: string): Promise<boolean> {
-  const cached = introspectionCache.get(sessionId);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.active;
-  }
-
-  let active = false;
   try {
     const resp = await fetch(`${AUTH_SERVICE_URL}/internal/introspect`, {
       method: "POST",
@@ -59,14 +48,11 @@ async function checkRevocation(sessionId: string, refreshToken: string): Promise
       body: JSON.stringify({ refreshToken })
     });
     const json = (await resp.json()) as { active?: boolean };
-    active = json.active === true;
+    return json.active === true;
   } catch (err) {
     console.error(`auth-service introspection call failed for session ${sessionId}:`, (err as Error).message);
-    active = false; // fail closed — can't confirm the session is still valid
+    return false; // fail closed — can't confirm the session is still valid
   }
-
-  introspectionCache.set(sessionId, { active, expiresAt: Date.now() + INTROSPECTION_TTL_MS });
-  return active;
 }
 
 app.get("/health", (_req, res) => {
@@ -416,7 +402,7 @@ app.post("/pds/internal/verify", express.json({ limit: "6mb" }), async (req, res
   // capability this repo used to have on its old access-token-per-request
   // model; see docs/encryption-workflow.md). Kong only sets this when the
   // client sent X-Require-Revocation-Check: true, since it costs an extra
-  // Keycloak round trip (mitigated by the 1h cache above).
+  // Keycloak round trip on every request.
   if (requireRevocationCheck) {
     const active = lookup.refreshToken ? await checkRevocation(sessionId, lookup.refreshToken) : false;
     if (!active) {
