@@ -34,7 +34,7 @@ let pdsSignKeyPair: EcKeyPair;
 // the identifier /pds/internal/verify already has on hand — one Keycloak
 // round trip amortized across a burst of requests on the same session.
 const introspectionCache = new Map<string, { active: boolean; expiresAt: number }>();
-const INTROSPECTION_TTL_MS = 30_000;
+const INTROSPECTION_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 /**
  * RFC 7662 token introspection against Keycloak, run against the refresh
@@ -416,7 +416,7 @@ app.post("/pds/internal/verify", express.json({ limit: "6mb" }), async (req, res
   // capability this repo used to have on its old access-token-per-request
   // model; see docs/encryption-workflow.md). Kong only sets this when the
   // client sent X-Require-Revocation-Check: true, since it costs an extra
-  // Keycloak round trip (mitigated by the 30s cache above).
+  // Keycloak round trip (mitigated by the 1h cache above).
   if (requireRevocationCheck) {
     const active = lookup.refreshToken ? await checkRevocation(sessionId, lookup.refreshToken) : false;
     if (!active) {

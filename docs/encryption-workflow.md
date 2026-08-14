@@ -40,7 +40,7 @@ forwarding instead once the PDS has vouched for the request).
 sequenceDiagram
     participant Device as Mobile Device
     participant Kong
-    participant PDS as Cryptography-Service (PDL)
+    participant PDS as PDS
     participant Auth as auth-service
     participant Keycloak
 
@@ -49,14 +49,14 @@ sequenceDiagram
     Kong->>PDS: (routed, no crypto)
     PDS-->>Device: {deviceId, deviceJwt}<br/>deviceJwt = ES256 JWT, signed by PDS,<br/>claims = {deviceId, devicePublicKeyJwk}
 
-    Note over Device,Keycloak: Login (Category 1)
-    Device->>Device: build signed envelope {username,password}<br/>sign with device private key (ECDSA P-256)
+    Note over Device,Keycloak: Login (Category 1) — PIN or biometric authentication
+    Device->>Device: build signed envelope {pin, bioAuthToken}<br/>sign with device private key (ECDSA P-256)
     Device->>Device: JWE-encrypt envelope to PDS's public key<br/>(ECDH-ES+A256KW / A256GCM)
     Device->>Kong: POST /pds/session<br/>Authorization: Bearer deviceJwt
     Kong->>PDS: (routed)
     PDS->>PDS: verify deviceJwt, decrypt JWE,<br/>verify envelope signature
-    PDS->>Auth: POST /internal/login {username, password}<br/>X-Auth-Caller: cryptography-service
-    Auth->>Keycloak: ROPC login (grant_type=password)
+    PDS->>Auth: POST /internal/login {pin, bioAuthToken}<br/>X-Auth-Caller: cryptography-service
+    Auth->>Keycloak: ROPC login (grant_type=password,<br/>pin/bioAuthToken used as the credential)
     Keycloak-->>Auth: access_token + refresh_token
     Auth->>Auth: verify access_token against Keycloak JWKS
     Auth-->>PDS: {sub, roles, scopes, refreshToken}
@@ -80,51 +80,62 @@ phase for the route's nominal upstream never actually fires).
 sequenceDiagram
     participant Device as Mobile Device
     participant Kong as Kong (custom-auth plugin)
-    participant PDS as Cryptography-Service (PDL)
+    participant Crypto as Cryptography-Service
+    participant PDS as PDS
     participant Account as account-service
 
     Device->>Device: build signed envelope {request body}<br/>sign with device private key
     Device->>Device: JWE-encrypt with SEK (alg=dir, enc=A256GCM)
     Device->>Kong: request /pds/bff/...<br/>Authorization: Bearer sessionJwt
 
-    Kong->>PDS: POST /pds/internal/verify<br/>{sessionJwt, jwe, method, upstreamPath, requestUniqueId}
-    PDS->>PDS: check signing sessionJwt and check expiry  (401 plaintext on failure)
-    PDS->>PDS: look up SEK: Redis, fallback to Postgres<br/>(401 not-found / 500 db-error, both plaintext)
-    PDS->>PDS: decrypt payload with SEK (400 encrypted on failure)
-    PDS->>PDS: verify envelope signature vs stored device pubkey<br/>(400 encrypted on failure)
-    PDS-->>Kong: outcome: authenticated | unauthenticated | rejected<br/>(+ plaintext body, sessionId, X-User-* fields, when authenticated)
+    Kong->>Crypto: POST /pds/internal/verify<br/>{sessionJwt, jwe, method, upstreamPath, requestUniqueId}
+    Crypto->>Crypto: check signing sessionJwt and check expiry  (401 plaintext on failure)
+    Crypto->>PDS: POST check SEK is still valid<br/>(sessionId)
+    PDS-->>Crypto: SEK (or not found)<br/>Redis
 
-    alt not authenticated
-        Kong-->>Device: relay PDS's ready-made response verbatim<br/>(plaintext JSON 401/500, or pre-encrypted JWE 400)
-    else authenticated
-        Kong->>Account: plaintext request + trusted X-User-* headers<br/>(Kong calls account-service directly via resty.http)
-        Account-->>Kong: plaintext response<br/>(Kong itself synthesizes 504/502 on timeout/connection failure)
-        Kong->>PDS: POST /pds/internal/encrypt-response<br/>{sessionId, requestUniqueId, plaintextBodyBase64}
-        PDS->>PDS: build 0x00 response envelope, sign,<br/>JWE-encrypt with SEK
-        PDS-->>Kong: {responseJwe}
-        Kong-->>Device: responseJwe, copying account-service's status<br/>(or Kong's own synthesized 502/504)
+    alt SEK not found / db error
+        Crypto-->>Kong: 401 not-found / 500 db-error<br/>(plaintext)
+        Kong-->>Device: 401 not-found / 500 db-error<br/>(plaintext)
+    else SEK found
+        Crypto->>Crypto: decrypt payload with SEK (400 encrypted on failure)
+        Crypto->>Crypto: verify envelope signature vs device pubkey,<br/>cache-aside (Redis)<br/>(400 encrypted on failure)
+        Crypto-->>Kong: outcome: authenticated | unauthenticated | rejected<br/>(+ plaintext body, sessionId, X-User-* fields, when authenticated)
+
+        alt not authenticated
+            Kong-->>Device: relay Cryptography-Service's ready-made response verbatim<br/>(plaintext JSON 401, or pre-encrypted JWE 400)
+        else authenticated
+            Kong->>Account: plaintext request + trusted X-User-* headers<br/>(Kong calls account-service directly via resty.http)
+            Account-->>Kong: plaintext response<br/>(Kong itself synthesizes 504/502 on timeout/connection failure)
+            Kong->>Crypto: POST /pds/internal/encrypt-response<br/>{sessionId, requestUniqueId, plaintextBodyBase64}
+            Crypto->>Crypto: build 0x00 response envelope, sign,<br/>JWE-encrypt with SEK
+            Crypto-->>Kong: {responseJwe}
+            Kong-->>Device: responseJwe, copying account-service's status<br/>(or Kong's own synthesized 502/504)
+        end
     end
 
     Device->>Device: decrypt with SEK, verify signature
 ```
 
-The two PDS calls (`/pds/internal/verify`, `/pds/internal/encrypt-response`)
-are internal-only — gated by an `X-Auth-Caller: kong` header, same
-convention this repo has used since the very first version of this plugin.
-The SEK itself never leaves the PDS/Vault boundary: Kong only ever sees
-ciphertext on the wire to/from the device, plaintext for the single hop to
-`account-service`, and the PDS's already-built ciphertext coming back.
+The two Cryptography-Service calls (`/pds/internal/verify`,
+`/pds/internal/encrypt-response`) are internal-only — gated by an
+`X-Auth-Caller: kong` header, same convention this repo has used since the
+very first version of this plugin. Cryptography-Service in turn calls PDS
+to check the SEK is still valid before it trusts it for decryption. The SEK
+itself never leaves the Cryptography-Service/PDS/Vault boundary: Kong only
+ever sees ciphertext on the wire to/from the device, plaintext for the
+single hop to `account-service`, and Cryptography-Service's already-built
+ciphertext coming back.
 
 ## Real-time revocation checking (opt-in, Category 2/3)
 
 Session validity is normally bounded only by the 4-hour `sessionJwt`/SEK
-lifetime — the PDS never checks back with Keycloak on ordinary Category 2/3
-requests. A client can opt a single request into a live check by sending
-`X-Require-Revocation-Check: true`; Kong forwards that as
+lifetime — Cryptography-Service never checks back with Keycloak on ordinary
+Category 2/3 requests. A client can opt a single request into a live check
+by sending `X-Require-Revocation-Check: true`; Kong forwards that as
 `requireRevocationCheck` on its existing `/pds/internal/verify` call, no
-extra round trip between Kong and the PDS. The PDS then asks `auth-service`
-to introspect the Keycloak **refresh token** captured at login (RFC 7662),
-not the access
+extra round trip between Kong and Cryptography-Service. Cryptography-Service
+then introspects the Keycloak **refresh token** captured at login directly
+against Keycloak (RFC 7662), not the access
 token — Keycloak's `accessTokenLifespan` here is 120 seconds, far shorter
 than the 4h session this check protects, so the access token would read
 "inactive" almost immediately for reasons unrelated to revocation. A
@@ -135,36 +146,38 @@ introspecting the refresh token still reflects live revocation state.
 sequenceDiagram
     participant Device as Mobile Device
     participant Kong as Kong (custom-auth plugin)
-    participant PDS as Cryptography-Service (PDL)
-    participant Auth as auth-service
+    participant Crypto as Cryptography-Service
+    participant PDS as PDS
     participant Keycloak
     participant Account as account-service
 
     Device->>Kong: request /pds/bff/...<br/>X-Require-Revocation-Check: true
-    Kong->>PDS: POST /pds/internal/verify<br/>{..., requireRevocationCheck: true}
-    PDS->>PDS: verify sessionJwt, look up SEK<br/>(as in the normal Category 2 flow)
-    alt cached result < 30s old
-        PDS->>PDS: reuse cached active/inactive verdict
-        PDS-->>Kong: outcome: authenticated | unauthenticated | rejected<br/>(+ plaintext body, sessionId, X-User-* fields, when authenticated)
-    else cache miss/expired
-        Kong->>Auth: POST /internal/introspect {refreshToken}<br/>X-Auth-Caller: Kong
-        Auth->>Keycloak: POST /realms/poc/protocol/openid-connect/token/introspect<br/>token=refresh_token, client=poc-introspection (confidential)
-        Keycloak-->>Auth: {active: true|false}
-        Auth-->>Kong: outcome: authenticated | unauthenticated 
-    end
-    alt inactive (revoked/logged out)
-        PDS-->>Kong: outcome: rejected, 401, encrypted {"error":"session revoked"}
-        Kong-->>Device: relay PDS's encrypted 401 verbatim
-    else active
-        PDS->>PDS: decrypt payload with SEK (400 encrypted on failure)
-        PDS->>PDS: verify envelope signature vs stored device pubkey<br/>(400 encrypted on failure)
-        PDS-->>Kong: outcome: authenticated<br/>(+ plaintext body, sessionId, X-User-* fields)
-        Kong->>Account: plaintext request + trusted X-User-* headers
-        Account-->>Kong: plaintext response
-        Kong->>PDS: POST /pds/internal/encrypt-response<br/>{sessionId, requestUniqueId, plaintextBodyBase64}
-        PDS->>PDS: build 0x00 response envelope, sign,<br/>JWE-encrypt with SEK
-        PDS-->>Kong: {responseJwe}
-        Kong-->>Device: responseJwe, copying account-service's status
+    Kong->>Crypto: POST /pds/internal/verify<br/>{..., requireRevocationCheck: true}
+    Crypto->>Crypto: check signing sessionJwt and check expiry  (401 plaintext on failure)
+    Crypto->>PDS: POST check SEK is still valid<br/>(sessionId)
+    PDS-->>Crypto: SEK (or not found)<br/>Redis, fallback to Postgres
+
+    alt SEK not found / db error
+        Crypto-->>Kong: 401 not-found / 500 db-error<br/>(plaintext)
+        Kong-->>Device: 401 not-found / 500 db-error<br/>(plaintext)
+    else SEK found
+        Crypto->>Crypto: decrypt challengeJWE with SEK, verify signature
+        Crypto->>Keycloak: introspect to Keycloak<br/>POST /realms/poc/protocol/openid-connect/token/introspec
+        Keycloak-->>Crypto: {active: true|false}
+        alt inactive (revoked/logged out)
+            Crypto-->>Kong: outcome: rejected, 401, encrypted {"error":"session revoked"}
+            Kong-->>Device: relay Cryptography-Service's encrypted 401 verbatim
+        else active
+            Crypto->>Crypto: decrypt payload with SEK (400 encrypted on failure)
+            Crypto->>Crypto: verify envelope signature<br/>cache-aside (Redis)<br/>(400 encrypted on failure)
+            Crypto-->>Kong: outcome: authenticated<br/>(+ plaintext body, sessionId, X-User-* fields)
+            Kong->>Account: plaintext request + trusted X-User-* headers
+            Account-->>Kong: plaintext response
+            Kong->>Crypto: POST /pds/internal/encrypt-response<br/>{sessionId, requestUniqueId, plaintextBodyBase64}
+            Crypto->>Crypto: build 0x00 response envelope, sign,<br/>JWE-encrypt with SEK
+            Crypto-->>Kong: {responseJwe}
+            Kong-->>Device: responseJwe, copying account-service's status
+        end
     end
 ```
 
@@ -174,25 +187,6 @@ calls authenticated as a public client. Since the rejection happens after
 the SEK lookup, the 401 body is encrypted like other Category 2 errors
 rather than plaintext.
 
-## Category 3 — MiniApp BFF API
-
-Identical request/response flow to Category 2. The only difference is where
-the SEK comes from: Category 2 reads Redis with a Postgres fallback (both
-owned by this PDS deployment); Category 3 — running in a MiniApp's own
-environment, unable to reach this PDS's database — instead calls a "Session
-Encryption Key Inquiry API" over HTTP. In this repo that's a config
-switch (`PDS_SEK_SOURCE=http`), not a separate deployment: setting it points
-`lookupSekViaInquiry()` at `PDS_SEK_INQUIRY_URL`, which for this POC is a
-self-referential stub (`GET /pds/internal/sek-inquiry/:sessionId` on the same
-service) that proves the alternate-source code path exists without standing
-up a second PDS instance.
-
-## Payload layout
-
-Every request/response payload is wrapped in this binary envelope *before*
-JWE encryption (request) / *after* JWE decryption (response). Implemented in
-`Cryptography-Service/src/pds/envelope.ts` and mirrored in
-`client-simulator/src/envelope.ts`.
 
 **Signed request envelope:**
 
@@ -312,26 +306,3 @@ both gated by `X-Auth-Caller: cryptography-service`).
   login instead, since that reflects live Keycloak session state without
   expiring almost immediately like the access token would.
 
-## Related
-
-- Binary envelope codec: `Cryptography-Service/src/pds/envelope.ts`,
-  `client-simulator/src/envelope.ts` (intentionally duplicated — no
-  monorepo tooling in this repo, and the two sides are asymmetric: PDS
-  mostly decodes requests and encodes responses, the client is the mirror).
-- RFC 3394 AESWrap: `Cryptography-Service/src/pds/aesWrap.ts`.
-- Vault key provisioning: `Cryptography-Service/src/pds/vaultClient.ts`.
-- SEK storage (Redis cache-aside over Postgres): `Cryptography-Service/src/pds/sekStore.ts`.
-- Refresh token encryption for revocation checks: `Cryptography-Service/src/pds/tokenCrypto.ts`.
-- Hourly SEK cleanup: `Cryptography-Service/src/pds/cleanupJob.ts`.
-- All PDS HTTP routes (device enrollment, session acquiring, the internal
-  verify/encrypt-response endpoints Kong calls): `Cryptography-Service/src/server.ts`.
-- Keycloak login and introspection, on behalf of `Cryptography-Service`:
-  `auth-service/src/server.ts`.
-- Client-side session/device flow: `client-simulator/src/pdsClient.ts`.
-- Kong routing: `kong/kong.yml`. Category 2/3 auth-check-and-forward logic:
-  `kong/plugins/custom-auth/handler.lua` (+ `schema.lua` for its config
-  fields — `pds_verify_url`, `pds_encrypt_response_url`,
-  `account_service_url`, `timeout_ms`).
-
-See the "Test payload encryption" section in [`README.md`](../README.md) for
-how to run this end to end.
