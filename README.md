@@ -153,6 +153,43 @@ ever reaches `account-service`.
 - **New login while Postgres is down**: `login` will fail with `HTTP 500`
   plaintext — the PDS can't durably store a new SEK.
 
+## Test real-time revocation checking
+
+Category 2 normally trusts the `sessionJwt` for its full 4-hour lifetime.
+Passing `--revocation-check` makes `client-simulator` send
+`X-Require-Revocation-Check: true`, which makes Kong's `custom-auth` plugin
+ask `auth-service` to introspect the Keycloak refresh token captured at
+login (RFC 7662, via the confidential `poc-introspection` client) before
+trusting the session for that one request.
+
+```bash
+docker compose run --rm client-simulator login demo-user
+docker compose run --rm client-simulator accounts --revocation-check
+```
+
+This should succeed exactly like a plain `accounts` call. To see it actually
+catch a revoked session, log the user's Keycloak session out from under it
+without touching the PDS session (the `sessionJwt` itself has no idea this
+happened):
+
+```bash
+# Get an admin token, then log out demo-user's Keycloak sessions
+docker compose exec keycloak /opt/keycloak/bin/kcadm.sh config credentials \
+  --server http://localhost:8080 --realm master --user admin --password admin
+docker compose exec keycloak /opt/keycloak/bin/kcadm.sh get users -r poc -q username=demo-user
+# copy the "id" from the output above, then:
+docker compose exec keycloak /opt/keycloak/bin/kcadm.sh update users/<user-id>/logout -r poc
+```
+
+```bash
+docker compose run --rm client-simulator accounts --revocation-check
+```
+
+Expect `HTTP 401` with an encrypted `{"error":"session revoked"}` body (the
+SEK is already known at that point, so the rejection is encrypted like other
+Category 2 errors) — while a plain `accounts` call (no flag) still succeeds,
+since it never asks Keycloak.
+
 ## Inspect Kong
 
 Kong Admin API:
@@ -192,10 +229,13 @@ This POC intentionally takes shortcuts for local runnability. For production:
    + PKCE flow at the Keycloak layer instead.
 4. Keycloak runs in `start-dev` mode with an in-memory H2 database and
    `sslRequired: none`. Use a real database, TLS, and a hardened realm.
-5. Real-time revocation checking is not implemented — session validity is
-   bounded only by the 4-hour `sessionJwt`/SEK lifetime. A production
-   system may want a revocation list or shorter-lived sessions for
-   sensitive operations.
+5. Real-time revocation checking is opt-in, not automatic — a client has to
+   send `X-Require-Revocation-Check: true` on a `/pds/bff/*` call (see
+   "Test real-time revocation checking" below) for that one request to pay
+   the extra Keycloak round trip; otherwise session validity is bounded only
+   by the 4-hour `sessionJwt`/SEK lifetime. Production should decide this
+   per-endpoint (e.g. always-on for money-movement calls) rather than
+   leaving it to the client to ask.
 6. The device keypair is reused for both ECDSA signing and as the
    `ECDH-ES+A256KW` target for the Category 1 response, rather than
    separate keys per purpose — see `docs/encryption-workflow.md`'s

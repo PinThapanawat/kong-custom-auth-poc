@@ -183,7 +183,8 @@ export async function callBffApi(
   upstreamPath: string,
   apiId: ApiId,
   jsonBody?: unknown,
-  tamper = false
+  tamper = false,
+  requireRevocationCheck = false
 ): Promise<BffCallResult> {
   const sek = Buffer.from(session.sekBase64, "base64");
   const requestUniqueId = crypto.randomUUID();
@@ -209,7 +210,8 @@ export async function callBffApi(
   const resp = await rawHttpRequest(`${pdsBaseUrl}/pds/bff${upstreamPath}`, method, {
     Authorization: `Bearer ${session.sessionJwt}`,
     "Content-Type": "application/jose",
-    "X-Client-Transaction-Id": requestUniqueId
+    "X-Client-Transaction-Id": requestUniqueId,
+    ...(requireRevocationCheck ? { "X-Require-Revocation-Check": "true" } : {})
   }, Buffer.from(requestJwe));
 
   const contentType = resp.headers["content-type"] ?? "";

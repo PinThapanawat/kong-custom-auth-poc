@@ -11,7 +11,13 @@ CREATE TABLE IF NOT EXISTS session_encryption_key (
   wrapped_encryption_key  BYTEA       NOT NULL CHECK (octet_length(wrapped_encryption_key) = 40),
   device_public_key       BYTEA       NOT NULL CHECK (octet_length(device_public_key) = 91),
   expiration_bucket       SMALLINT    NOT NULL CHECK (expiration_bucket BETWEEN 0 AND 23),
-  created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- AES-256-GCM-encrypted Keycloak refresh token (iv || authTag || ciphertext,
+  -- see auth-service/src/pds/tokenCrypto.ts), variable length unlike
+  -- wrapped_encryption_key above. Only present when Category 1 login got a
+  -- refresh_token back from Keycloak; used by Category 2/3's opt-in
+  -- X-Require-Revocation-Check to introspect live revocation status.
+  wrapped_refresh_token   BYTEA
 );
 
 CREATE INDEX IF NOT EXISTS idx_sek_expiration_bucket ON session_encryption_key (expiration_bucket);

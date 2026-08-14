@@ -50,8 +50,8 @@ sequenceDiagram
     Kong->>PDS: (routed)
     PDS->>PDS: verify deviceJwt, decrypt JWE,<br/>verify envelope signature
     PDS->>Keycloak: ROPC login (grant_type=password)
-    Keycloak-->>PDS: access_token
-    PDS->>PDS: generate sessionId + 32-byte SEK<br/>store SEK (Postgres primary, Redis 4h cache)<br/>issue sessionJwt (ES256, 4h)
+    Keycloak-->>PDS: access_token + refresh_token
+    PDS->>PDS: generate sessionId + 32-byte SEK<br/>store SEK + AES-256-GCM-encrypted refresh_token<br/>(Postgres primary, Redis 4h cache)<br/>issue sessionJwt (ES256, 4h)
     PDS->>PDS: build 0x01 response envelope (embeds SEK)<br/>sign with PDS private key<br/>JWE-encrypt to device's public key
     PDS-->>Device: encrypted, signed response
     Device->>Device: decrypt with device private key<br/>verify signature with PDS's public key<br/>extract sessionJwt + SEK
@@ -105,6 +105,62 @@ convention this repo has used since the very first version of this plugin.
 The SEK itself never leaves the PDS/Vault boundary: Kong only ever sees
 ciphertext on the wire to/from the device, plaintext for the single hop to
 `account-service`, and the PDS's already-built ciphertext coming back.
+
+## Real-time revocation checking (opt-in, Category 2/3)
+
+Session validity is normally bounded only by the 4-hour `sessionJwt`/SEK
+lifetime — the PDS never checks back with Keycloak on ordinary Category 2/3
+requests. A client can opt a single request into a live check by sending
+`X-Require-Revocation-Check: true`; Kong forwards that as
+`requireRevocationCheck` on its existing `/pds/internal/verify` call, no
+extra round trip between Kong and the PDS. The PDS then introspects the
+Keycloak **refresh token** captured at login (RFC 7662), not the access
+token — Keycloak's `accessTokenLifespan` here is 120 seconds, far shorter
+than the 4h session this check protects, so the access token would read
+"inactive" almost immediately for reasons unrelated to revocation. A
+revoked/logged-out Keycloak session invalidates its refresh tokens too, so
+introspecting the refresh token still reflects live revocation state.
+
+```mermaid
+sequenceDiagram
+    participant Device as Mobile Device
+    participant Kong as Kong (custom-auth plugin)
+    participant PDS as auth-service (PDS)
+    participant Keycloak
+    participant Account as account-service
+
+    Device->>Kong: request /pds/bff/...<br/>X-Require-Revocation-Check: true
+    Kong->>PDS: POST /pds/internal/verify<br/>{..., requireRevocationCheck: true}
+    PDS->>PDS: verify sessionJwt, look up SEK<br/>(as in the normal Category 2 flow)
+    alt cached result < 30s old
+        PDS->>PDS: reuse cached active/inactive verdict
+    else cache miss/expired
+        PDS->>PDS: decrypt stored refresh_token (AES-256-GCM, KEK from Vault)
+        PDS->>Keycloak: POST /realms/poc/protocol/openid-connect/token/introspect<br/>token=refresh_token, client=poc-introspection (confidential)
+        Keycloak-->>PDS: {active: true|false}
+        PDS->>PDS: cache verdict for 30s (keyed by sessionId)
+    end
+    alt inactive (revoked/logged out)
+        PDS-->>Kong: outcome: rejected, 401, encrypted {"error":"session revoked"}
+        Kong-->>Device: relay PDS's encrypted 401 verbatim
+    else active
+        PDS->>PDS: decrypt payload with SEK (400 encrypted on failure)
+        PDS->>PDS: verify envelope signature vs stored device pubkey<br/>(400 encrypted on failure)
+        PDS-->>Kong: outcome: authenticated<br/>(+ plaintext body, sessionId, X-User-* fields)
+        Kong->>Account: plaintext request + trusted X-User-* headers
+        Account-->>Kong: plaintext response
+        Kong->>PDS: POST /pds/internal/encrypt-response<br/>{sessionId, requestUniqueId, plaintextBodyBase64}
+        PDS->>PDS: build 0x00 response envelope, sign,<br/>JWE-encrypt with SEK
+        PDS-->>Kong: {responseJwe}
+        Kong-->>Device: responseJwe, copying account-service's status
+    end
+```
+
+Introspection uses a separate confidential client (`poc-introspection`) from
+the public `poc-client` used for login — Keycloak rejects introspection
+calls authenticated as a public client. Since the rejection happens after
+the SEK lookup, the 401 body is encrypted like other Category 2 errors
+rather than plaintext.
 
 ## Category 3 — MiniApp BFF API
 
@@ -176,7 +232,8 @@ Acquiring Response V1", Category 1 only) — same as above with a 32-byte
 | `pdsSignKeyPair` (EC P-256) | PDS startup, once (persisted in Vault) | Vault (`secret/data/pds/ec-sign-keypair`) | ES256-signs `deviceJwt`, `sessionJwt`, and every response envelope |
 | Device keypair (EC P-256) | Client, once, persisted locally | Client only (private half never leaves the device) | Signs every request envelope; also the `ECDH-ES+A256KW` target for the Category 1 response (see deviation below) |
 | SEK (AES-256) | PDS, per session | Postgres (AESWrap-wrapped) + Redis (4h cache); device via the Category 1 response | `dir`+`A256GCM` content key for all Category 2/3 request/response bodies |
-| SEK-wrap KEK (AES-256) | PDS startup, once (persisted in Vault) | Vault (`secret/data/pds/sek-wrap-kek`) | RFC 3394 AESWrap key-encryption-key protecting SEKs at rest in Postgres |
+| SEK-wrap KEK (AES-256) | PDS startup, once (persisted in Vault) | Vault (`secret/data/pds/sek-wrap-kek`) | RFC 3394 AESWrap key-encryption-key protecting SEKs at rest in Postgres; also encrypts the refresh token below (`tokenCrypto.ts`) |
+| Keycloak refresh token | Keycloak, per login (ROPC) | Postgres (AES-256-GCM-encrypted) + Redis (4h cache); never sent to the device | Introspected (RFC 7662) for the opt-in `X-Require-Revocation-Check` on Category 2/3 |
 
 ## Deviations from the spec
 
@@ -227,13 +284,16 @@ Acquiring Response V1", Category 1 only) — same as above with a 32-byte
   JWT" endpoint — no App Attest / Play Integrity / hardware-backed key
   attestation, unlike the PDF's reference to a real Keycloak-backed Device
   Enrollment API and `deviceJwt` claims structure.
-- **Real-time revocation checking was dropped, not replaced.** The prior
-  implementation in this repo supported an `X-Require-Revocation-Check`
-  header that hit Keycloak's introspection endpoint per request. That's
-  gone — session validity is now bounded only by the 4-hour `sessionJwt`/SEK
-  lifetime. This isn't something the PDF asked for; it's a capability
-  regression versus what this repo used to have, worth knowing about rather
-  than silently losing.
+- **Real-time revocation checking, restored on a different token.** The
+  prior implementation in this repo supported an `X-Require-Revocation-Check`
+  header that introspected the raw Keycloak *access* token on every request
+  — that design assumed the access token itself was the session credential.
+  It no longer fits now that Category 2/3 runs on a PDS-minted `sessionJwt`
+  (4h) decoupled from Keycloak's own 120-second `accessTokenLifespan`. The
+  header is back (see "Real-time revocation checking" above), but it now
+  introspects the Keycloak **refresh token** captured once at Category 1
+  login instead, since that reflects live Keycloak session state without
+  expiring almost immediately like the access token would.
 
 ## Related
 
@@ -244,6 +304,7 @@ Acquiring Response V1", Category 1 only) — same as above with a 32-byte
 - RFC 3394 AESWrap: `auth-service/src/pds/aesWrap.ts`.
 - Vault key provisioning: `auth-service/src/pds/vaultClient.ts`.
 - SEK storage (Redis cache-aside over Postgres): `auth-service/src/pds/sekStore.ts`.
+- Refresh token encryption for revocation checks: `auth-service/src/pds/tokenCrypto.ts`.
 - Hourly SEK cleanup: `auth-service/src/pds/cleanupJob.ts`.
 - All PDS HTTP routes (device enrollment, session acquiring, the internal
   verify/encrypt-response endpoints Kong calls): `auth-service/src/server.ts`.

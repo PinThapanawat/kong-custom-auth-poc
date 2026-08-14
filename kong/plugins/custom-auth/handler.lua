@@ -55,6 +55,7 @@ function CustomAuthHandler:access(conf)
   local full_path = kong.request.get_path()
   local upstream_path = strip_prefix(full_path, "/pds/bff")
   local request_unique_id = kong.request.get_header("X-Client-Transaction-Id")
+  local require_revocation_check = kong.request.get_header("X-Require-Revocation-Check") == "true"
 
   local httpc = http.new()
   httpc:set_timeout(conf.timeout_ms)
@@ -70,6 +71,7 @@ function CustomAuthHandler:access(conf)
       method = method,
       upstreamPath = upstream_path,
       requestUniqueId = request_unique_id,
+      requireRevocationCheck = require_revocation_check,
     }),
     headers = {
       ["Content-Type"] = "application/json",

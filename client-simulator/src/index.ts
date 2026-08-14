@@ -35,14 +35,26 @@ async function main() {
   }
 
   if (command === "accounts") {
+    const requireRevocationCheck = rest.includes("--revocation-check");
     const { privateKey } = await ensureDeviceIdentity(PDS_BASE_URL);
     const session = loadSession();
-    const result = await callBffApi(PDS_BASE_URL, privateKey, session, "GET", "/accounts", API_IDS.ACCOUNTS_LIST);
+    const result = await callBffApi(
+      PDS_BASE_URL,
+      privateKey,
+      session,
+      "GET",
+      "/accounts",
+      API_IDS.ACCOUNTS_LIST,
+      undefined,
+      false,
+      requireRevocationCheck
+    );
     printResult("GET /accounts", result);
     return;
   }
 
   if (command === "transfer" || command === "transfer-tamper") {
+    const requireRevocationCheck = rest.includes("--revocation-check");
     const amount = Number(rest[0] ?? 100);
     const { privateKey } = await ensureDeviceIdentity(PDS_BASE_URL);
     const session = loadSession();
@@ -54,18 +66,20 @@ async function main() {
       "/accounts/transfer",
       API_IDS.ACCOUNTS_TRANSFER,
       { to: "ACC-77002", amount },
-      command === "transfer-tamper"
+      command === "transfer-tamper",
+      requireRevocationCheck
     );
     printResult("POST /accounts/transfer", result);
     return;
   }
 
-  console.error("Usage: client-simulator <enroll|login|accounts|transfer|transfer-tamper> [args]");
+  console.error("Usage: client-simulator <enroll|login|accounts|transfer|transfer-tamper> [args] [--revocation-check]");
   console.error(`  enroll                          Generate/persist a device keypair and enroll it with the PDS`);
   console.error(`  login <${Object.keys(DEMO_USERS).join("|")}>       Category 1: acquire a session + SEK`);
-  console.error(`  accounts                        Category 2: GET /accounts through the PDS`);
-  console.error(`  transfer [amount]                Category 2: POST /accounts/transfer through the PDS`);
+  console.error(`  accounts [--revocation-check]    Category 2: GET /accounts through the PDS`);
+  console.error(`  transfer [amount] [--revocation-check]   Category 2: POST /accounts/transfer through the PDS`);
   console.error(`  transfer-tamper [amount]         Same, but flips a ciphertext byte to prove tamper detection`);
+  console.error(`  --revocation-check               Send X-Require-Revocation-Check: true (live Keycloak introspection)`);
   process.exit(1);
 }
 

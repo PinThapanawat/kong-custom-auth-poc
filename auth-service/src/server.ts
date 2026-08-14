@@ -23,6 +23,15 @@ const KEYCLOAK_CLIENT_ID = process.env.KEYCLOAK_CLIENT_ID ?? "poc-client";
 const PDS_SEK_SOURCE = process.env.PDS_SEK_SOURCE === "http" ? "http" : "db";
 const PDS_SEK_INQUIRY_URL = process.env.PDS_SEK_INQUIRY_URL ?? "http://auth-service:8080/pds/internal/sek-inquiry";
 
+// Category 2/3's opt-in X-Require-Revocation-Check (see /pds/internal/verify
+// below) introspects the Keycloak refresh token captured at Category 1
+// login. Introspection requires a confidential client (Keycloak rejects
+// introspection calls from the public poc-client used for login), so a
+// separate introspection-only client/secret is used here.
+const KEYCLOAK_INTROSPECT_URL = process.env.KEYCLOAK_INTROSPECT_URL ?? "";
+const KEYCLOAK_INTROSPECTION_CLIENT_ID = process.env.KEYCLOAK_INTROSPECTION_CLIENT_ID ?? "poc-introspection";
+const KEYCLOAK_INTROSPECTION_CLIENT_SECRET = process.env.KEYCLOAK_INTROSPECTION_CLIENT_SECRET;
+
 const JWKS = jose.createRemoteJWKSet(new URL(KEYCLOAK_JWKS_URL), {
   cooldownDuration: 30_000,
   cacheMaxAge: 600_000
@@ -34,6 +43,51 @@ const KNOWN_SCOPES = new Set(["account.read", "account.write"]);
 // Loaded once at startup from Vault — see initPds() below.
 let pdsEncKeyPair: EcKeyPair;
 let pdsSignKeyPair: EcKeyPair;
+
+// Cached by sessionId (not by token jti, unlike the introspection cache this
+// repo used to have on its old access-token-per-request model) since that's
+// the identifier /pds/internal/verify already has on hand — one Keycloak
+// round trip amortized across a burst of requests on the same session.
+const introspectionCache = new Map<string, { active: boolean; expiresAt: number }>();
+const INTROSPECTION_TTL_MS = 30_000;
+
+/**
+ * RFC 7662 token introspection against Keycloak, run against the refresh
+ * token captured at Category 1 login (not the access token — Keycloak's
+ * accessTokenLifespan is 120s here, far shorter than the 4h sessionJwt this
+ * check protects, so it would report "inactive" almost immediately for
+ * reasons unrelated to revocation). A revoked/logged-out Keycloak session
+ * invalidates its refresh tokens too, so this still reflects live
+ * revocation state.
+ */
+async function checkRevocation(sessionId: string, refreshToken: string): Promise<boolean> {
+  const cached = introspectionCache.get(sessionId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.active;
+  }
+
+  let active = false;
+  try {
+    const resp = await fetch(KEYCLOAK_INTROSPECT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        token: refreshToken,
+        token_type_hint: "refresh_token",
+        client_id: KEYCLOAK_INTROSPECTION_CLIENT_ID,
+        ...(KEYCLOAK_INTROSPECTION_CLIENT_SECRET ? { client_secret: KEYCLOAK_INTROSPECTION_CLIENT_SECRET } : {})
+      })
+    });
+    const json = (await resp.json()) as { active?: boolean };
+    active = json.active === true;
+  } catch (err) {
+    console.error(`Keycloak introspection call failed for session ${sessionId}:`, (err as Error).message);
+    active = false; // fail closed — can't confirm the session is still valid
+  }
+
+  introspectionCache.set(sessionId, { active, expiresAt: Date.now() + INTROSPECTION_TTL_MS });
+  return active;
+}
 
 app.get("/health", (_req, res) => {
   res.json({ status: "UP" });
@@ -145,6 +199,7 @@ app.post("/pds/session", express.text({ type: "application/jose", limit: "1mb" }
   }
 
   let accessToken: string;
+  let refreshToken: string | undefined;
   try {
     const tokenResp = await fetch(KEYCLOAK_TOKEN_URL, {
       method: "POST",
@@ -159,11 +214,12 @@ app.post("/pds/session", express.text({ type: "application/jose", limit: "1mb" }
     if (!tokenResp.ok) {
       return res.status(401).json({ authenticated: false, message: "invalid credentials" });
     }
-    const tokenJson = (await tokenResp.json()) as { access_token?: string };
+    const tokenJson = (await tokenResp.json()) as { access_token?: string; refresh_token?: string };
     if (!tokenJson.access_token) {
       return res.status(401).json({ authenticated: false, message: "invalid credentials" });
     }
     accessToken = tokenJson.access_token;
+    refreshToken = tokenJson.refresh_token;
   } catch (err) {
     console.error("Keycloak ROPC login failed:", (err as Error).message);
     return res.status(401).json({ authenticated: false, message: "authentication failed" });
@@ -190,7 +246,7 @@ app.post("/pds/session", express.text({ type: "application/jose", limit: "1mb" }
   const devicePublicKeyDer = devicePublicKeyForVerify.export({ type: "spki", format: "der" }) as Buffer;
 
   try {
-    await storeSek(sessionId, sek, devicePublicKeyDer);
+    await storeSek(sessionId, sek, devicePublicKeyDer, refreshToken);
   } catch (err) {
     console.error("SEK store failed:", (err as Error).message);
     return res.status(500).json({ authenticated: false, message: "session store unavailable" });
@@ -265,11 +321,12 @@ async function lookupSekViaInquiry(sessionId: string): Promise<SekLookupResult> 
     const resp = await fetch(`${PDS_SEK_INQUIRY_URL}/${sessionId}`, { signal: AbortSignal.timeout(3000) });
     if (resp.status === 404) return { status: "not_found" };
     if (!resp.ok) return { status: "db_error" };
-    const json = (await resp.json()) as { sekBase64: string; devicePublicKeyBase64: string };
+    const json = (await resp.json()) as { sekBase64: string; devicePublicKeyBase64: string; refreshToken?: string };
     return {
       status: "found",
       sek: Buffer.from(json.sekBase64, "base64"),
-      devicePublicKeyDer: Buffer.from(json.devicePublicKeyBase64, "base64")
+      devicePublicKeyDer: Buffer.from(json.devicePublicKeyBase64, "base64"),
+      refreshToken: json.refreshToken
     };
   } catch (err) {
     console.warn("SEK inquiry call failed:", (err as Error).message);
@@ -286,7 +343,8 @@ app.get("/pds/internal/sek-inquiry/:sessionId", async (req, res) => {
   if (lookup.status === "db_error") return res.status(500).json({ error: "db error" });
   res.json({
     sekBase64: lookup.sek.toString("base64"),
-    devicePublicKeyBase64: lookup.devicePublicKeyDer.toString("base64")
+    devicePublicKeyBase64: lookup.devicePublicKeyDer.toString("base64"),
+    refreshToken: lookup.refreshToken
   });
 });
 
@@ -311,12 +369,20 @@ interface VerifyResult {
 app.post("/pds/internal/verify", express.json({ limit: "6mb" }), async (req, res) => {
   if (!requireKongCaller(req, res)) return;
 
-  const { sessionJwt, jwe, method, upstreamPath, requestUniqueId: requestUniqueIdHeader } = (req.body ?? {}) as {
+  const {
+    sessionJwt,
+    jwe,
+    method,
+    upstreamPath,
+    requestUniqueId: requestUniqueIdHeader,
+    requireRevocationCheck
+  } = (req.body ?? {}) as {
     sessionJwt?: string;
     jwe?: string;
     method?: string;
     upstreamPath?: string;
     requestUniqueId?: string;
+    requireRevocationCheck?: boolean;
   };
 
   const unauthenticated = (httpStatus: number, body: unknown) =>
@@ -379,6 +445,18 @@ app.post("/pds/internal/verify", express.json({ limit: "6mb" }), async (req, res
       responseBody: responseJwe
     } satisfies VerifyResult);
   };
+
+  // Opt-in real-time revocation check (not in the PDF spec — restores a
+  // capability this repo used to have on its old access-token-per-request
+  // model; see docs/encryption-workflow.md). Kong only sets this when the
+  // client sent X-Require-Revocation-Check: true, since it costs an extra
+  // Keycloak round trip (mitigated by the 30s cache above).
+  if (requireRevocationCheck) {
+    const active = lookup.refreshToken ? await checkRevocation(sessionId, lookup.refreshToken) : false;
+    if (!active) {
+      return rejected(401, "session revoked");
+    }
+  }
 
   // Step 4 (PDF p.5): decrypt payload with SEK.
   if (typeof jwe !== "string" || !jwe) {
